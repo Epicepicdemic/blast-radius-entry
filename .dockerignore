@@ -10,5 +10,9 @@
 !mutation_summaries.py
 !bounded_batch.py
 !runner.py
+!change_shapes.py
+!import_readers.py
+!pinned_data.py
+!table_readers.py
 **/__pycache__/
 **/*.pyc
