@@ -1,0 +1,11 @@
+*
+!builder/
+!builder/**
+!maps.json
+!selector.py
+!patching.py
+!packing.py
+!proofs.py
+!shared_writes.py
+**/__pycache__/
+**/*.pyc
