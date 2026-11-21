@@ -18,13 +18,23 @@ Direct assignment to an ordinary instance receiver, such as `self.field = value`
 
 The selector derives mutating methods from Python’s mutable container types, including the collections types, and checks the first argument of in-place operator calls. Passing a potentially shared object to a helper can also let it change that object. The same guard checks positional, keyword and unpacked arguments, including class attributes, module names and unresolved aliases. Recognized pure builtins such as `len` and `sorted` are exempt for that call. Their argument expressions are still checked for nested writes.
 
+At image build time, `mutation_summaries.py` parses every Python module in the pinned SQLGlot package. Each function, method and lambda gets a parameter signature and a mask of possible writes or escapes. The analysis follows local aliases, assignments through objects, in-place operators, container and closure captures, returned arguments and calls through callbacks. A direct getter can return an element. Its caller can still receive a shared object. An unresolved call marks its arguments and receiver inside the calling function. A worklist propagates these effects back to callers until recursive groups reach a fixed point.
+
+At selection time, a unique project binding can exempt individual arguments whose receiving parameters have no recorded effect. The resolver follows direct imports, re-exports and unambiguous aliases. It binds positional-only and keyword-only parameters and includes every parameter an unpack can reach. Rebindings, opaque decorators, unresolved instance or constructor dispatch and ambiguous targets preserve the previous shared-argument check. Enclosing calls and nested calls are each checked. A full-suite decision on either side of the patch takes precedence.
+
+The pinned image contains the original summaries and their call constraints. Each diff gets its own view of the changed modules. The selector recomputes summaries for touched definitions and resolves transitive calls against every file in that diff. Static analysis reads the reconstructed source. Live verification can later run selected tests against it in a child process.
+
+The selector sends the full suite for a patch over 1 MiB or over 2,000 added and removed lines combined across files. It checks byte size before opening the patch and counts edits before parsing Python. The shared-write check uses binary search on changed line numbers. Each function summary has a bounded work allowance for syntax visits and alias propagation. Exceeding it marks every parameter as possibly mutated. Patched modules and their call graph also share an aggregate work allowance.
+
+A separate worker analyzes one commit at a time. The parent gives it up to three wall-clock seconds per commit and up to 150 seconds across the batch, including map loading. A timed-out commit gets the precomputed full-suite plan. The parent can restart the worker for the next commit. When the batch deadline expires, it emits full plans for the unresolved remainder.
+
 ### Rules that can omit a test
 
 | Evidence | Required tests and rationale |
 | --- | --- |
 | Equal Python syntax trees | Keep explicit source readers. CPython compiles the same syntax, including type comments. A reader can still observe different bytes or encoding. |
 | Existing data file | Keep every observed reader of that path, including consumers of shared fixtures. Every byte of an SQL fixture counts. An unobserved path selects the suite. |
-| Covered function-body replacement | Keep tests reaching any changed line, its enclosing multiline statement or guard, source readers and code-object inspectors. All touched files contribute. An unobserved line, lexical-scope change, new statement layout, or changed test module widens to the suite. |
+| Covered function-body replacement | Keep tests reaching any changed line, its enclosing multiline statement or guard, source readers and code-object inspectors. All touched files contribute. A changed test module or an edit without sufficient coverage or a structural certificate selects the suite. |
 | Aligned comparison instructions | Recursively compare the old and new code objects. Require identical scope, flags, constants, exception ranges, instruction boundaries and opcodes. Only an operand of an existing comparison may differ. Keep readers of every differing instruction’s source line and enclosing statement. This recovers an unexecuted branch without assuming a comparison result. |
 | Literal in a lambda body | Changing one bounded literal leaves lambda construction and defaults intact. Keep every test that entered a lambda on that definition line. Lambdas sharing the line share their readers. |
 | Literal argument captured by a closure | Resolve an unshadowed direct import. The pinned factory must only define an undecorated inner function and return it, with deferred annotations and no evaluated defaults. Both calls bind identical argument positions. Keep every test reaching the returned function body across all registrations. |
@@ -34,7 +44,24 @@ The selector derives mutating methods from Python’s mutable container types, i
 
 The six specialized rules starting with aligned comparisons require a single changed production file and one replaced physical line with preserved indentation. Each literal rule checks the complete syntax trees for exactly one eligible value difference. Source readers and known function-code inspectors stay selected. A failed proof uses the broader selection. Any unresolved initialization change, compile failure, unsupported diff, new or deleted file, context mismatch, or absent coverage selects the suite. In particular, a syntax error can reach a test through a registry whose Python imports are invisible in that test.
 
-The runtime never executes a patch. Domain-specific initialization arguments above describe the pinned source. Coverage is empirical. Test order, cross-test state, native readers and timing can expose dependencies absent from a baseline run.
+The initialization proofs use the pinned source. Coverage is empirical. Test order, cross-test state, native readers and timing can expose dependencies absent from a baseline run.
+
+### Selection switches
+
+Each switch defaults to 1 and accepts a Docker build argument or a runtime environment override such as `-e FUNCTION_INSERTIONS=0`.
+
+| Switch | Effect |
+| --- | --- |
+| `CLASS_TABLE_ENTRIES` | Checks replacements inside one class dict, list or tuple display. The build follows shallow copies and inherited table names to covered reads. It includes literal-key and reflective readers. Changes confined to a lambda body can use the original lambda’s entry coverage through all copies. |
+| `FUNCTION_INSERTIONS` | For a certified read-only edit inside one existing function, includes the entire original function’s body coverage and its source and code readers. New declarations, unresolved calls and shared writes select the suite. |
+| `TOUCHED_ARGUMENTS` | Matches unchanged argument slots at the same callee and recognizes fresh formatted strings. Explicit shared receivers, known at-risk parameters and unresolved bindings keep their existing guards. |
+| `LOCAL_SCOPE_CHANGES` | Extends the function rule to changes in local variables. It checks flags, closure bindings, nested code objects and references that could be shadowed. |
+| `UNUSED_IMPORTS` | Checks a single added or removed module-level alias for unused or re-exported names. Includes binding readers and importers that request the name or use a star import. |
+| `FAST_ANALYSIS` | Loads image-built binary indexes, reuses pinned binding facts, and stops analysis once a full-suite decision is known. |
+| `NARROW_SHARED_ARGS` | Resolves possibly shared arguments and includes known binding readers. A shared binding without reader evidence selects the suite. |
+| `ISOLATION_DROP` | Runs eligible small unittest selections in an isolated child. Passing selections can be dropped. |
+| `ENGINE_SKIP` | Replays the TPC-DS frontend on eligible changes before dropping the executor test. |
+| `IDENTITY_EQUIVALENCE` | Checks whether a single identity/equality comparison has the same result for the pinned class or enum. |
 
 ### Worker placement
 
@@ -42,7 +69,7 @@ Longest-processing-time-first packing prices one through eight workers in intege
 
 ## Reproduce
 
-Build the entry with `docker build --platform linux/amd64 -t br-entry .`. Its default target uses the committed maps. A separate Git stage fetches only the pinned SQLGlot commit, checks the detached HEAD against its full hash, and copies the checkout into the Python image. The image uses only the Python standard library at runtime.
+Build the entry with `docker build --platform linux/amd64 -t br-entry .`. Its default target uses the committed maps. A separate Git stage fetches only the pinned SQLGlot commit, checks the detached HEAD against its full hash, and copies the checkout into the Python image. The entry and tracer install the same locked Python packages, including DuckDB, NumPy and pandas.
 
 ```sh
 docker build --platform linux/amd64 --target tracer -t br-tracer .
@@ -61,7 +88,7 @@ Independent edits were applied to clean copies of the pinned checkout. Pytest ra
 
 The source-fetch stage uses the digest-pinned Alpine Git image from Docker Hub. The entry uses CPython and its standard library from the official Python slim image, and the pinned SQLGlot source (MIT). SQLite is provided by the base image. The evaluation script calls the Builders starter kit’s official scorer. GitHub Actions uses actions/checkout and actions/upload-artifact, and Docker Buildx uses BuildKit. All selector, packing and tracing code in this repository was written for this entry.
 
-Map collection installs the following distributions at the versions in [the official package lock](builder/requirements.lock).
+The image installs the following distributions at the versions in [the official package lock](builder/requirements.lock).
 
 `ast_serialize`, `cfgv`, `distlib`, `duckdb`, `execnet`, `filelock`, `identify`, `iniconfig`, `Jinja2`, `librt`, `markdown2`, `MarkupSafe`, `mypy`, `mypy_extensions`, `nodeenv`, `numpy`, `packaging`, `pandas`, `pandas-stubs`, `pathspec`, `pdoc`, `platformdirs`, `pluggy`, `pre_commit`, `psutil`, `Pygments`, `pyperf`, `pytest`, `pytest-timeout`, `pytest-xdist`, `python-dateutil`, `python-discovery`, `pytz`, `PyYAML`, `ruff`, `setuptools`, `setuptools-scm`, `types-python-dateutil`, `types-pytz`, `typing_extensions`, `tzdata`, `vcs-versioning`, `virtualenv`.
 

@@ -1,8 +1,18 @@
 """Strictly apply text hunks to pinned bytes. Unsupported metadata widens selection."""
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 import re
+
+
+MAX_CHANGED_LINES = 2000
+MAX_PATCH_BYTES = 1024 * 1024
+
+
+def overlaps(sorted_points, first, last):
+    i = bisect_left(sorted_points, first)
+    return i < len(sorted_points) and sorted_points[i] <= last
 
 
 class UnknownPatch(ValueError):
@@ -19,6 +29,8 @@ class Change:
     insertions: set = field(default_factory=set)
     # Physical line numbers in the reconstructed new file.
     added: set = field(default_factory=set)
+    # New-file boundary after removing a line, including deletions with no additions.
+    deletions: set = field(default_factory=set)
 
 
 HUNK = re.compile(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*(?:\n|$)")
@@ -40,7 +52,21 @@ def lf_lines(data):
     return [p + b"\n" for p in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
 
 
+def read_patch(path, root):
+    with path.open("rb") as stream:
+        return apply_patch(stream.read(MAX_PATCH_BYTES + 1), root)
+
+
 def apply_patch(raw, root):
+    if len(raw) > MAX_PATCH_BYTES:
+        raise UnknownPatch("patch byte limit")
+    # Fast lower bound before splitting or opening any source file. A data
+    # line resembling a file header is counted exactly inside the hunk below.
+    marked = raw.count(b"\n+") + raw.count(b"\n-")
+    headers = raw.count(b"\n+++ b/") + raw.count(b"\n--- a/")
+    if marked - headers > MAX_CHANGED_LINES:
+        raise UnknownPatch("changed line limit")
+    changed_lines = 0
     lines = lf_lines(raw)
     i = 0
     seen = set()
@@ -66,7 +92,7 @@ def apply_patch(raw, root):
         before = base(root, path)
         old = lf_lines(before)
         result = []
-        removed, insertions, added = set(), set(), set()
+        removed, insertions, added, deletions = set(), set(), set(), set()
         cursor = 0
         if i >= len(lines) or not HUNK.fullmatch(lines[i]):
             raise UnknownPatch("missing hunks")
@@ -102,6 +128,10 @@ def apply_patch(raw, root):
                     i += 1
                 if op == b" ":
                     end_block()
+                else:
+                    changed_lines += 1
+                    if changed_lines > MAX_CHANGED_LINES:
+                        raise UnknownPatch("changed line limit")
                 if op != b"+":
                     if cursor >= len(old) or old[cursor] != payload:
                         raise UnknownPatch("old bytes differ")
@@ -113,6 +143,7 @@ def apply_patch(raw, root):
                 if op == b"-":
                     old_layout.append(payload[:len(payload) - len(payload.lstrip())])
                     removed.add(cursor)
+                    deletions.add(len(result))
                 elif op == b"+":
                     added.add(len(result))
                     new_layout.append(payload[:len(payload) - len(payload.lstrip())])
@@ -120,7 +151,7 @@ def apply_patch(raw, root):
             if (consumed, emitted) != (old_count, new_count):
                 raise UnknownPatch("hunk length mismatch")
         result.extend(old[cursor:])
-        changes.append(Change(path, before, b"".join(result), removed, insertions, added))
+        changes.append(Change(path, before, b"".join(result), removed, insertions, added, deletions))
     if not changes:
         raise UnknownPatch("no files")
     return changes
