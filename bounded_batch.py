@@ -1,5 +1,7 @@
 """Run patch analysis in a killable worker under one wall-clock deadline."""
+import errno
 import multiprocessing
+import resource
 from stat import S_ISREG
 from time import monotonic
 
@@ -10,8 +12,24 @@ BATCH_SECONDS = 150
 COMMIT_SECONDS = 3
 
 
+# Includes the warm interpreter's inherited mappings (about 395 MiB on amd64).
+CHILD_ADDRESS_SPACE = 896 * 1024 * 1024
+
+
+def limit_child_resources(limit):
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    for inherited in resource.getrlimit(resource.RLIMIT_AS):
+        if inherited != resource.RLIM_INFINITY:
+            limit = min(limit, inherited)
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+
 def _serve(channel, parent_channel, analyze):
     parent_channel.close()
+    try:
+        limit_child_resources(CHILD_ADDRESS_SPACE)
+    except (ValueError, OSError):
+        return  # A worker without an enforceable ceiling cannot supply evidence.
     while True:
         try:
             path = channel.recv()
@@ -19,7 +37,15 @@ def _serve(channel, parent_channel, analyze):
             return
         try:
             result = analyze(path)
-        except (OSError, ValueError, SyntaxError, RecursionError, OverflowError, MemoryError):
+        except MemoryError:
+            # Discard the worker and its partially populated caches. EOF widens
+            # this patch, and bounded_results forks a fresh worker for the next.
+            return
+        except OSError as error:
+            if error.errno == errno.ENOMEM:
+                return
+            result = None
+        except (ValueError, SyntaxError, RecursionError, OverflowError):
             result = None
         channel.send(result)
 

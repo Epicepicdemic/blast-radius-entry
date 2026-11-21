@@ -8,11 +8,53 @@ CONTAINERS = MAPPINGS + (list, tuple, set, frozenset, bytearray, deque)
 SCALARS = (str, bytes, int, bool, type(None), float, complex)
 
 
+import os
+
+DEEP_STATE = os.environ.get("DEEP_STATE", "1").strip().lower() not in ("0", "false", "no", "off")
+DEEP_WATCH = "<deep state>"  # Cone marker: a writer without a nameable sink.
+deep = False  # Set by the parent for one verification; inherited by its forks.
+
+
+def _project_object(kind):
+    module = getattr(kind, "__module__", "") or ""
+    return module == "sqlglot" or module.startswith("sqlglot.")
+
+
+def _fields(value):
+    """Instance fields of a project-owned object: __dict__ and slots."""
+    fields = []
+    d = getattr(value, "__dict__", None)
+    if isinstance(d, dict):
+        fields.extend(d.items())
+    for klass in type(value).__mro__:
+        for slot in klass.__dict__.get("__slots__", ()) or ():
+            if isinstance(slot, str) and slot not in ("__dict__", "__weakref__"):
+                try:
+                    fields.append((slot, object.__getattribute__(value, slot)))
+                except AttributeError:
+                    pass
+    return fields
+
+
 def fingerprint(value, seen):
     kind = type(value)
     if kind in SCALARS:
         return (kind, value)
     if kind not in CONTAINERS:
+        if deep and _project_object(kind) and not isinstance(value, type):
+            # An expression or other project object held in shared state can be
+            # changed in place (args, parent, comments, cached type, meta).
+            marker = id(value)
+            if marker in seen:
+                return (kind, marker)
+            seen.add(marker)
+            parts = []
+            for name, field in _fields(value):
+                if name == "parent":  # Follow the tree downwards only.
+                    parts.append((name, id(field)))
+                else:
+                    parts.append((name, fingerprint(field, seen)))
+            return (kind, marker, hash(tuple(parts)))
         return (kind, id(value))
     marker = id(value)
     if marker in seen:
@@ -64,7 +106,8 @@ def snapshot(names):
             keys = (n for n in namespace if not n.startswith("__")) if names is None else names.intersection(namespace)
             for name in keys:
                 val = namespace[name]
-                if type(val) in CONTAINERS + SCALARS:
+                if type(val) in CONTAINERS + SCALARS or (
+                        deep and _project_object(type(val)) and not isinstance(val, type)):
                     state[tag, name] = fingerprint(val, set())
     return state
 

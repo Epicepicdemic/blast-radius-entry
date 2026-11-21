@@ -5,6 +5,7 @@ import json
 import marshal
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,8 @@ from unittest.mock import patch
 
 from import_state import capture, import_graph, modules, observe_initializers
 from patching import Change
-from selector import Index, select_batch
+from batch_entry import run_batch
+from selector import Index
 from snapshot_cone import ImportSnapshot, key_site, outer_functions
 from verify import CHILD_ADDRESS_SPACE, is_project
 
@@ -97,6 +99,11 @@ class SnapshotTest(unittest.TestCase):
                 chosen, _ = self.select(after)
                 self.assertEqual(chosen, 15 | 16)
 
+    def test_snapshot_sigsegv_selects_full_suite_and_next_snapshot_runs(self):
+        after = self.before + "import signal\nsignal.raise_signal(signal.SIGSEGV)\n"
+        self.assertEqual(self.select(after), (Readers.all, Readers.all))
+        self.assertEqual(self.select(self.before.replace("'x': 1", "'x': 2")), (1 | 2 | 8 | 16, 16))
+
     def test_snapshot_allocation_failure_selects_full_suite(self):
         after = self.before + f"import mmap\nregion = mmap.mmap(-1, {CHILD_ADDRESS_SPACE})\n"
         self.assertEqual(self.select(after), (Readers.all, Readers.all))
@@ -112,6 +119,51 @@ class SnapshotTest(unittest.TestCase):
 
 
 class BatchRecoveryTest(unittest.TestCase):
+    def test_batch_setup_errors_emit_every_full_plan(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        (root / "commits").mkdir()
+        names = ['a"quote', "middle", "third"]
+        for name in reversed(names):
+            (root / "commits" / (name + ".patch")).touch()
+        tests = [{"id": str(i), "number": i, "seconds": 0.2} for i in range(7)]
+        manifest = root / "tests.json"
+        maps = root / "maps.json"
+        maps.write_text(json.dumps({"ids": list(range(11))}))
+        import pinned_data
+        subprocess.run([sys.executable, pinned_data.__file__, str(maps)], check=True)
+        maps.write_text("damaged")
+        self.enterContext(patch("batch_entry.__file__", str(root / "batch_entry.py")))
+        self.enterContext(patch("selector.__file__", str(root / "selector.py")))
+
+        def check_full(numbers):
+            output = io.StringIO()
+            run_batch(output, root, root, monotonic())
+            rows = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual([r["commit"] for r in rows], names)
+            for row in rows:
+                self.assertLessEqual(len(row["workers"]), 8)
+                self.assertEqual(sorted(n for w in row["workers"] for n in w), list(numbers))
+
+        for bad in (None, "{", '{"tests": null}'):
+            with self.subTest(unreadable_manifest=bad):
+                if bad is not None:
+                    manifest.write_text(bad)
+                check_full(range(11))
+        manifest.write_text(json.dumps({"tests": [{"number": 31}, {"number": 45}]}))
+        check_full([31, 45])  # Runtime numbers survive malformed timing data.
+        manifest.write_text(json.dumps({"tests": tests}))
+        with patch("pinned_data.load", side_effect=OSError("unreadable index")) as load:
+            check_full(range(7))
+            load.assert_called_once()
+        with patch("selector.load_index", return_value=Index({"ids": [], "masks": []})), \
+                patch("verify.WarmSuite.warm", side_effect=RuntimeError("warmup failed")) as warm, \
+                patch("bounded_batch.bounded_results") as analyze:
+            check_full(range(7))
+            warm.assert_called_once()
+            analyze.assert_not_called()
+
     def test_parent_snapshot_key_error_only_widens_affected_commit(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -138,7 +190,8 @@ class BatchRecoveryTest(unittest.TestCase):
         select = self.enterContext(patch.object(ImportSnapshot, "select",
                                    side_effect=[(1, 1), KeyError("snapshot reader"), (2, 2)]))
         output = io.StringIO()
-        select_batch(output, root, root, index, monotonic())
+        with patch("selector.load_index", return_value=index):
+            run_batch(output, root, root, monotonic())
         self.assertEqual(select.call_count, 3)
         self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()], [
             {"commit": "first", "workers": [[1]]},

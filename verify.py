@@ -14,13 +14,10 @@ import unittest
 from types import CodeType, FunctionType
 from time import monotonic
 
+from bounded_batch import CHILD_ADDRESS_SPACE, limit_child_resources
 from fixture_overlay import Fixtures
 from mutation_summaries import module_name
 from state_watch import changed_readers, snapshot
-
-
-# Includes the warm interpreter's inherited mappings (about 395 MiB on amd64).
-CHILD_ADDRESS_SPACE = 896 * 1024 * 1024
 
 
 class Overlay(importlib.abc.MetaPathFinder, importlib.abc.InspectLoader):
@@ -323,11 +320,7 @@ def fork_masks(run, fallback, deadline, cap):
             signal.signal(signal.SIGPROF, signal.SIG_DFL)
             signal.setitimer(signal.ITIMER_PROF, cap)
             resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
-            limit = CHILD_ADDRESS_SPACE
-            for inherited in resource.getrlimit(resource.RLIMIT_AS):
-                if inherited != resource.RLIM_INFINITY:
-                    limit = min(limit, inherited)
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+            limit_child_resources(CHILD_ADDRESS_SPACE)
             passed, extra = run()
             os.write(write_fd, f"{passed:x} {extra:x}".encode())
         except BaseException:

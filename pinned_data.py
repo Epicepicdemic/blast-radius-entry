@@ -15,4 +15,7 @@ def load(path, fast):
 if __name__ == "__main__":
     for arg in sys.argv[1:]:
         source = Path(arg)
-        source.with_suffix(".bin").write_bytes(marshal.dumps(load(source, False)))
+        data = load(source, False)
+        source.with_suffix(".bin").write_bytes(marshal.dumps(data))
+        if source.name == "maps.json":
+            source.with_name("test-count").write_text(str(len(data["ids"])))

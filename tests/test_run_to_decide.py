@@ -133,6 +133,16 @@ class ForkTest(unittest.TestCase):
         body = first + "    @classmethod\n    def tearDownClass(cls): raise RuntimeError('teardown')\n"
         self.assertEqual(self.verify(body, ["test_first"]), (0, 0))
 
+    def test_sigsegv_discards_earlier_passes_and_zeroes_the_core_limit(self):
+        limits = fork_masks(lambda: resource.getrlimit(resource.RLIMIT_CORE), (1, 1), monotonic() + 4, 2)
+        self.assertEqual(limits, (0, 0))
+        first = "    def test_first(self): pass\n"
+        crash = "    def test_second(self):\n        import signal\n        signal.raise_signal(signal.SIGSEGV)\n"
+        for writers, expected in ((0, (0, 0)), (2, (0, Readers.all))):
+            with self.subTest(writers=writers):
+                self.assertEqual(self.verify(first + crash, ["test_first", "test_second"], writers=writers), expected)
+        self.assertEqual(self.verify(first, ["test_first"]), (1, 0))
+
     def test_address_space_limit_discards_passes_and_spares_parent(self):
         parent_limits = resource.getrlimit(resource.RLIMIT_AS)
         limits = fork_masks(lambda: resource.getrlimit(resource.RLIMIT_AS), (0, 0), monotonic() + 4, 2)

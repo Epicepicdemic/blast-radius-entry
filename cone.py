@@ -1,10 +1,106 @@
 """Extend the pinned selector with candidates for runtime verification."""
 import ast
+import os
 from functools import lru_cache
 
 from change_shapes import align_directives
 from patching import overlaps
 from shared_writes import MUTATORS, OPERATOR_CALLS
+from state_watch import DEEP_STATE, DEEP_WATCH
+
+
+def flag(name, default=True):
+    val = os.environ.get(name)
+    if val is None or not val.strip():
+        return default
+    return val.strip().lower() not in ("0", "false", "no", "off")
+
+
+HEADER_EDITS = flag("HEADER_EDITS")
+# Needs the verifier's deep fingerprint to observe in-place changes of objects.
+CALL_WRITES = flag("CALL_WRITES", False) and DEEP_STATE
+# Decorators whose change only alters how an existing call binds the function.
+# The body still runs only in tests that called it at the pin.
+REBINDING_DECORATORS = frozenset(("staticmethod", "classmethod", "cache", "lru_cache"))
+# Attribute names through which code can observe a function header without calling it.
+# SQLGlot reads __doc__ and __dict__ only on classes, and its two signature
+# readers either always call the function afterwards (optimizer rules) or are
+# excluded below (executor env's null_if_any can skip the call).
+HEADER_READS = ("__code__", "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
+                "__signature__", "__closure__")
+HEADER_EXCLUDED_PATHS = frozenset(("sqlglot/executor/env.py",))
+
+
+def _decorator_name(node):
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _dump(node):
+    return ast.dump(node) if node is not None else None
+
+
+def _plain_default(node):
+    """A default whose evaluation at definition time cannot fail or share state."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_plain_default(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(k is not None and _plain_default(k) and _plain_default(v) for k, v in zip(node.keys, node.values))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _plain_default(node.operand)
+    return False
+
+
+def header_change_allowed(old, new, deferred_annotations):
+    """Signature, return and decorator changes that only alter calls of this function.
+
+    Defaults run at definition time: each must be unchanged or a plain literal.
+    Annotations run at definition time unless postponed by the future import.
+    Decorators run at definition time: both lists must be equal or consist only
+    of rebinding decorators. A property changes attribute reads into calls, so
+    it is never admitted.
+    """
+    if type(old) is not type(new) or old.name != new.name:
+        return False
+    if [_dump(d) for d in old.decorator_list] != [_dump(d) for d in new.decorator_list]:
+        names = [_decorator_name(d) for d in old.decorator_list + new.decorator_list]
+        if not all(n in REBINDING_DECORATORS for n in names):
+            return False
+        for d in old.decorator_list + new.decorator_list:
+            call = d if isinstance(d, ast.Call) else None
+            if call and not all(_plain_default(a) for a in call.args + [k.value for k in call.keywords]):
+                return False
+    if [_dump(t) for t in getattr(old, "type_params", [])] != [_dump(t) for t in getattr(new, "type_params", [])]:
+        return False
+    old_defaults = {_dump(d) for d in old.args.defaults + [d for d in old.args.kw_defaults if d is not None]}
+    for d in new.args.defaults + [d for d in new.args.kw_defaults if d is not None]:
+        if _dump(d) not in old_defaults and not _plain_default(d):
+            return False
+    if not deferred_annotations:
+        def annotations(fn):
+            args = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs + [a for a in (fn.args.vararg, fn.args.kwarg) if a]
+            return [_dump(a.annotation) for a in args], _dump(fn.returns)
+        old_ann, new_ann = annotations(old), annotations(new)
+        # Each evaluated annotation must be an expression the old header already evaluated.
+        known = set(old_ann[0]) | {old_ann[1]}
+        if any(a is not None and a not in known for a in new_ann[0] + [new_ann[1]]):
+            return False
+    return True
+
+
+def deferred_annotations(tree):
+    return any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+               and any(a.name == "annotations" for a in n.names) for n in tree.body)
+
+
+def header_changed(old, new):
+    return ([_dump(d) for d in old.decorator_list] != [_dump(d) for d in new.decorator_list]
+            or _dump(old.args) != _dump(new.args) or _dump(old.returns) != _dump(new.returns))
 
 
 @lru_cache(maxsize=32)
@@ -32,20 +128,33 @@ def body_changes(change, equal):
         return None
     # Mask only the named definitions we can match. Generic header comparison
     # also masks definitions inside an if/try block, which have no entry here.
-    saved = [(new, new.body) for new in right.values()]
+    saved = [(new, new.body, new.args, new.decorator_list, new.returns) for new in right.values()]
+    headers = set()
+    if HEADER_EDITS and change.path not in HEADER_EXCLUDED_PATHS:
+        deferred = deferred_annotations(original) and deferred_annotations(patched)
+        removed, added = sorted(change.removed | change.insertions), sorted(change.added)
+        for key, new in right.items():
+            old = left[key]
+            if not (overlaps(removed, first_line(old), old.body[0].lineno)
+                    or overlaps(added, first_line(new), new.body[0].lineno)):
+                continue  # Untouched header lines; the equality check still covers them.
+            if header_changed(old, new) and header_change_allowed(old, new, deferred):
+                headers.add(key)
     try:
         for key, new in right.items():
             new.body = left[key].body
+            if key in headers:
+                new.args, new.decorator_list, new.returns = left[key].args, left[key].decorator_list, left[key].returns
         if not equal(original, patched):
             return None
     finally:
-        for new, body in saved:
-            new.body = body
+        for new, body, args, decorators, returns in saved:
+            new.body, new.args, new.decorator_list, new.returns = body, args, decorators, returns
     removed, added = sorted(change.removed), sorted(change.added)
     return [(".".join(key[1::2]), fn, right[key]) for key, fn in left.items()
             if (overlaps(removed, fn.lineno, fn.end_lineno)
                 or overlaps(added, right[key].lineno, right[key].end_lineno))
-            and not equal(fn.body, right[key].body)]
+            and (not equal(fn.body, right[key].body) or key in headers)]
 
 
 def referenced_state(node):
@@ -188,6 +297,12 @@ def analyze(index, changes, equal, shared=None):
             continue
         users = 0
         for name, before, after in edits:
+            if HEADER_EDITS and (header_changed(before, after)
+                                 or ast.get_docstring(before, clean=False) != ast.get_docstring(after, clean=False)):
+                # Code that inspects a function without calling it.
+                for attr in HEADER_READS:
+                    readers |= index.bits("attributes", attr)
+                hot = None
             if hot is not None:
                 if (any(not isinstance(d, ast.Name) or d.id not in ("classmethod", "staticmethod")
                         for d in before.decorator_list)
@@ -209,7 +324,14 @@ def analyze(index, changes, equal, shared=None):
                     return index.all, index.all, (), (), 0
                 sinks_old, sinks_new = write_targets(before), write_targets(after)
                 if sinks_old is None or sinks_new is None:
-                    return index.all, index.all, (), (), 0
+                    if not CALL_WRITES:
+                        return index.all, index.all, (), (), 0
+                    # A write through a call result has no nameable sink. Every
+                    # test reaching the function becomes a writer that the
+                    # verifier must observe in pristine and patched children.
+                    writers |= called or index.bits("users", path) or index.all
+                    watches.add(DEEP_WATCH)
+                    sinks_old, sinks_new = sinks_old or set(), sinks_new or set()
                 # A writer can be absent, skipped, or outside the run budget.
                 # Keep its known persistent readers even if this fork stays clean.
                 for sink in sinks_old | sinks_new:

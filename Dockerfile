@@ -52,6 +52,8 @@ ENV CENSUS_ARGS=$CENSUS_ARGS \
     IDENTITY_EQUIVALENCE=$IDENTITY_EQUIVALENCE
 ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 WORKDIR /app
-COPY snapshot_cone.py import_state.py maps.json selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json ./
+COPY snapshot_cone.py import_state.py maps.json batch_entry.py selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json ./
 RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
+# Bound glibc's per-thread arena reservations in DuckDB fixtures inside a capped fork.
+ENV MALLOC_ARENA_MAX=2
 CMD ["python", "/app/selector.py"]

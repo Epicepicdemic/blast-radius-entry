@@ -1,8 +1,14 @@
 """Choose tests using only dependencies measured on the unmodified checkout."""
-from contextlib import suppress
 import json
 import os
 import sys
+from batch_entry import main
+
+if __name__ == "__main__":
+    # Enter the guarded startup before importing the analysis modules below.
+    main()
+    sys.exit(0)
+
 from time import monotonic
 
 
@@ -13,66 +19,41 @@ def _env_flag(name, default=True):
     return val.strip().lower() not in ("0", "false", "no", "off")
 
 
-def main():
-    started = monotonic()
-    # The scorer enforces its two CPUs with a quota. Bound native thread pools
-    # that otherwise size themselves from the host's larger affinity mask.
-    if hasattr(os, "sched_getaffinity"):
-        allowed = sorted(os.sched_getaffinity(0))
-        if len(allowed) > 2:
-            os.sched_setaffinity(0, allowed[:2])
-
-    # Keep a private result stream even if an import writes to fd 1.
-    output = os.fdopen(os.dup(1), "w", encoding="utf-8")
-    os.dup2(2, 1)
-
-    root = Path("/sqlglot")
-    data = Path("/data")
-    fast = _env_flag("FAST_ANALYSIS")
+def load_index(root):
     from pinned_data import load
-    index = Index(load(Path(__file__).with_name("maps.json"), fast),
-                  Project(load(Path(__file__).with_name("mutations.json"), fast)),
-                  root=root, census_path=Path(__file__).with_name("census.json"))
-    with output:
-        select_batch(output, root, data, index, started)
+    fast = _env_flag("FAST_ANALYSIS")
+    return Index(load(Path(__file__).with_name("maps.json"), fast),
+                 Project(load(Path(__file__).with_name("mutations.json"), fast)),
+                 root=root, census_path=Path(__file__).with_name("census.json"))
 
 
-def select_batch(output, root, data, index, started):
-    from bounded_batch import BATCH_SECONDS, bounded_results
+def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
+    from bounded_batch import BATCH_SECONDS
     from packing import pack
     from patching import read_patch
 
-    tests = json.loads((data / "tests.json").read_bytes())["tests"]
+    index = load_index(root)
     numbers = {t["id"]: t["number"] for t in tests}
     # Both fail when the unmodified pinned suite runs in reverse order.
     reverse_failures = {numbers[name] for name in (
         "tests/dialects/test_dialect.py::TestDialect::test_enum",
         "tests/dialects/test_starrocks.py::TestStarrocks::test_time_slice_origin_roundtrip",
     ) if name in numbers}
-    durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
-    ranked = sorted(durations, key=lambda t: (-durations[t], t))
     positions = [numbers.get(name) for name in index.ids]
     unknown = set(ranked) - set(positions)
 
     def translate(mask):
         return {t for i, t in enumerate(positions) if t is not None and mask & (1 << i)}
 
-    full_plan = pack(set(ranked), ranked, durations)
-
     from time import process_time
     from cone import analyze as candidates, serialization_edit
     from state_watch import persistent_readers
     from verify import WarmSuite, runnable, schedule
 
-    patches = sorted((data / "commits").glob("*.patch"))
     deadline = started + BATCH_SECONDS
     suite = WarmSuite(root, index.ids)
-    shared = None
-    try:
-        suite.warm()
-        shared = persistent_readers(index)
-    except Exception:
-        suite.ready = False
+    suite.warm()
+    shared = persistent_readers(index)
     ordered = sorted((i for i, n in enumerate(positions) if n is not None),
                      key=lambda i: index.ids[i])
     duration = {i: durations[positions[i]] for i in ordered}
@@ -142,36 +123,20 @@ def select_batch(output, root, data, index, started):
                 fits = not writers or 2 * (estimated + 100 * writers.bit_count()) < 1000 * cap
                 if subset and fits and not writers & ~chosen_mask and (writers or saving > estimated):
                     changes = read_patch(path, root)
-                    passed, extra = suite.check(index, changes, subset, watch, hot, writers,
-                                                deadline, remaining_cpu)
+                    import state_watch
+                    state_watch.deep = state_watch.DEEP_STATE and state_watch.DEEP_WATCH in watch
+                    try:
+                        passed, extra = suite.check(index, changes, subset, watch, hot, writers,
+                                                    deadline, remaining_cpu)
+                    finally:
+                        state_watch.deep = False
             required = translate((selected & ~passed) | protected | extra) | unknown
             if required:
                 required.update(reverse_failures)
             workers = pack(required, ranked, durations, fill=False)
         return workers
 
-    # Drive output from the input inventory, even if the analysis worker stops.
-    full_json = json.dumps(full_plan, separators=(",", ":"))
-    results = None
-    for offset, path in enumerate(patches):
-        try:
-            if results is None:
-                results = bounded_results(patches[offset:], analyze, deadline)
-            analyzed, result = next(results)
-            if analyzed != path:
-                raise ValueError("analysis result is out of order")
-            workers = plan_for(path, result)
-            encoded = full_json if workers is full_plan else json.dumps(workers, separators=(",", ":"))
-        except Exception:
-            encoded = full_json
-            if results is not None:
-                with suppress(Exception):
-                    results.close()
-                results = None
-        output.write('{"commit":' + json.dumps(path.stem) + ',"workers":' + encoded + '}\n')
-    if results is not None:
-        with suppress(Exception):
-            results.close()
+    return analyze, plan_for, deadline
 
 
 import ast
@@ -559,7 +524,3 @@ class Index:
             if ptr is not None:
                 result |= self.masks[ptr]
         return result
-
-
-if __name__ == "__main__":
-    main()
