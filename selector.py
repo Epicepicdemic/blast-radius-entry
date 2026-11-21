@@ -1,4 +1,6 @@
 """Choose tests using only dependencies measured on the unmodified checkout."""
+from contextlib import suppress
+import json
 import os
 import sys
 from time import monotonic
@@ -13,18 +15,16 @@ def _env_flag(name, default=True):
 
 def main():
     started = monotonic()
-    from bounded_batch import BATCH_SECONDS, bounded_results
+    # The scorer enforces its two CPUs with a quota. Bound native thread pools
+    # that otherwise size themselves from the host's larger affinity mask.
+    if hasattr(os, "sched_getaffinity"):
+        allowed = sorted(os.sched_getaffinity(0))
+        if len(allowed) > 2:
+            os.sched_setaffinity(0, allowed[:2])
 
     # Keep a private result stream even if an import writes to fd 1.
     output = os.fdopen(os.dup(1), "w", encoding="utf-8")
     os.dup2(2, 1)
-    import json
-    from pathlib import Path
-    from packing import pack
-    from patching import read_patch
-
-    use_isolation_drop = _env_flag("ISOLATION_DROP", True)
-    use_engine_skip = _env_flag("ENGINE_SKIP", True)
 
     root = Path("/sqlglot")
     data = Path("/data")
@@ -32,10 +32,18 @@ def main():
     from pinned_data import load
     index = Index(load(Path(__file__).with_name("maps.json"), fast),
                   Project(load(Path(__file__).with_name("mutations.json"), fast)),
-                  root=root)
+                  root=root, census_path=Path(__file__).with_name("census.json"))
+    with output:
+        select_batch(output, root, data, index, started)
+
+
+def select_batch(output, root, data, index, started):
+    from bounded_batch import BATCH_SECONDS, bounded_results
+    from packing import pack
+    from patching import read_patch
+
     tests = json.loads((data / "tests.json").read_bytes())["tests"]
     numbers = {t["id"]: t["number"] for t in tests}
-    names = {t["number"]: t["id"] for t in tests}
     # Both fail when the unmodified pinned suite runs in reverse order.
     reverse_failures = {numbers[name] for name in (
         "tests/dialects/test_dialect.py::TestDialect::test_enum",
@@ -51,98 +59,125 @@ def main():
 
     full_plan = pack(set(ranked), ranked, durations)
 
-    runner = None
-    tpcds_num = None
-    if use_isolation_drop or use_engine_skip:
-        from runner import (
-            LiveRunner,
-            SLOW_UNITTEST_FILES,
-            TPCDS_BACKEND_FILES,
-            TPCDS_BACKEND_PREFIXES,
-            TPCDS_TEST_ID,
-        )
-        runner = LiveRunner(root)
-        tpcds_num = numbers.get(TPCDS_TEST_ID)
+    from time import process_time
+    from cone import analyze as candidates, serialization_edit
+    from state_watch import persistent_readers
+    from verify import WarmSuite, runnable, schedule
+
+    patches = sorted((data / "commits").glob("*.patch"))
+    deadline = started + BATCH_SECONDS
+    suite = WarmSuite(root, index.ids)
+    shared = None
+    try:
+        suite.warm()
+        shared = persistent_readers(index)
+    except Exception:
+        suite.ready = False
+    ordered = sorted((i for i, n in enumerate(positions) if n is not None),
+                     key=lambda i: index.ids[i])
+    duration = {i: durations[positions[i]] for i in ordered}
+    eligible = [i for i in ordered if runnable(index.ids[i])]
+    pool_ids = set(json.loads(Path(__file__).with_name("pool_readers.json").read_bytes()))
+    serde_sensitive = sum(1 << i for i in ordered if index.ids[i] in pool_ids)
+    # The same work list is used on fast and slow hosts. Deadlines only widen.
+    cap = min(5.0, 115 / max(1, len(patches)))
+
+    from snapshot_cone import ImportSnapshot, runtime_readers
+    snapshot = ImportSnapshot(index, root)
 
     def analyze(path):
-        return index.select_changes(read_patch(path, root))
+        start = process_time()
+        changes = read_patch(path, root)
+        selected, protected, watches, hot, writers = candidates(index, changes, equal_trees, shared)
+        if selected and any(serialization_edit(c) for c in changes):
+            selected |= serde_sensitive
+            protected |= serde_sensitive
+        use_snapshot = runtime_readers(index, changes, equal_trees) if selected == protected == index.all else None
+        return selected, protected, watches, hot, writers, use_snapshot, process_time() - start
 
-    deadline = started + BATCH_SECONDS
-    patches = sorted((data / "commits").glob("*.patch"))
-    try:
-        for patch, result in bounded_results(patches, analyze, deadline):
-            if result is None or result[0] == index.all:
-                workers = full_plan
-            else:
-                selected, related = result
-                raw_required = translate(selected) | unknown
-                fallback = bool(unknown)
-                required = set(raw_required)
-                if required:
-                    required.update(reverse_failures)
-                preferred = translate(related) if selected else set()
+    def cost(tests):
+        workers = pack(tests, ranked, durations, fill=False)
+        return 2000 * len(workers) + max(
+            (sum(durations[t] for t in w) for w in workers), default=0)
 
-                changes = None
-                if (not fallback and raw_required
-                        and (use_engine_skip or use_isolation_drop)
-                        and monotonic() < deadline - 1.0):
-                    if use_engine_skip and tpcds_num is not None and tpcds_num in raw_required:
-                        without_tpcds = set(required) - {tpcds_num}
-                        w_with = pack(required, ranked, durations, preferred)
-                        w_without = pack(without_tpcds, ranked, durations, preferred)
-                        cost_with = max((sum(durations[t] for t in w) for w in w_with), default=0) + 2000 * len(w_with)
-                        cost_without = max((sum(durations[t] for t in w) for w in w_without), default=0) + 2000 * len(w_without)
-                        if cost_with - cost_without > 12000:
-                            try:
-                                changes = read_patch(patch, root)
-                            except (OSError, ValueError, SyntaxError, RecursionError, OverflowError):
-                                changes = []
-                                fallback = True
-                            if not fallback and changes and not any(
-                                c.path in TPCDS_BACKEND_FILES or c.path.startswith(TPCDS_BACKEND_PREFIXES)
-                                for c in changes
-                            ):
-                                rem = deadline - monotonic()
-                                if rem > 1.0 and runner.verify_tpcds_frontend(changes, timeout_s=min(20, max(1, int(rem)))):
-                                    raw_required.discard(tpcds_num)
-                                    required = set(raw_required)
-                                    if required:
-                                        required.update(reverse_failures)
+    def plan_for(path, result):
+        if result is not None and result[5] is not None and suite.ready and monotonic() < deadline:
+            selected, protected, watch, hot, writers, (eager_importers, runtime_required), static_cpu = result
+            from verify import cgroup_cpu
+            if not snapshot.ready:
+                snapshot.prepare()
+            # Batch startup is charged by the scorer and bounded by the batch deadline.
+            start_cpu = cgroup_cpu()
+            changes = read_patch(path, root)
+            cap_left = cap - static_cpu - ((cgroup_cpu() or 0) - (start_cpu or 0))
+            selected, protected = snapshot.select(changes, deadline, cap_left)
+            selected |= eager_importers | runtime_required
+            protected |= runtime_required
+            if any(serialization_edit(c) for c in changes):
+                selected |= serde_sensitive
+                protected |= serde_sensitive
+            static_cpu += (cgroup_cpu() or 0) - (start_cpu or 0)
+            result = selected, protected, (), None, 0, False, static_cpu
+        if result is None or result[1] == index.all:
+            workers = full_plan
+        else:
+            selected, protected, watch, hot, writers, _, static_cpu = result
+            remaining_cpu = cap - static_cpu
+            # An unresolved shared write needs evidence for every possible
+            # writer. If the budget excludes one, keep the static outer bound.
+            extra = index.all if writers else 0
+            passed = 0
+            if selected != protected and suite.ready and remaining_cpu > 0.1 and monotonic() < deadline:
+                available = (selected & ~protected) | writers
+                order = [i for i in eligible if available & (1 << i)]
+                if writers:
+                    order.sort(key=lambda i: not writers & (1 << i))
+                subset = sorted(schedule(order, duration, min(1500, int(cap * 300))))
+                chosen_mask = sum(1 << i for i in subset)
+                current = translate(selected) | unknown
+                estimated = (75 if hot is not None else 280) + sum(duration[i] + 2 for i in subset)
+                saving = cost(current) - cost(current - translate(chosen_mask & ~protected))
+                # Broad state checkpoints bracket each possible writer in the
+                # pristine and patched runs. Reserve time for both passes.
+                fits = not writers or 2 * (estimated + 100 * writers.bit_count()) < 1000 * cap
+                if subset and fits and not writers & ~chosen_mask and (writers or saving > estimated):
+                    changes = read_patch(path, root)
+                    passed, extra = suite.check(index, changes, subset, watch, hot, writers,
+                                                deadline, remaining_cpu)
+            required = translate((selected & ~passed) | protected | extra) | unknown
+            if required:
+                required.update(reverse_failures)
+            workers = pack(required, ranked, durations, fill=False)
+        return workers
 
-                    if use_isolation_drop and not fallback and raw_required and len(raw_required) <= 40:
-                        req_ids = [names[t] for t in sorted(raw_required, key=lambda t: (durations[t], t))]
-                        req_files = {rid.split("::")[0] for rid in req_ids}
-                        if not any(f in SLOW_UNITTEST_FILES for f in req_files):
-                            sum_ms = sum(durations[t] for t in raw_required)
-                            w_cur = pack(required, ranked, durations, preferred)
-                            cur_cost = max((sum(durations[t] for t in w) for w in w_cur), default=0) + 2000 * len(w_cur)
-                            est_cpu = 850 + sum_ms + 60 * len(req_files)
-                            if sum_ms <= 900 and est_cpu <= cur_cost - 300:
-                                if changes is None:
-                                    try:
-                                        changes = read_patch(patch, root)
-                                    except (OSError, ValueError, SyntaxError, RecursionError, OverflowError):
-                                        changes = []
-                                        fallback = True
-                                if not fallback and changes and all(c.path.endswith(".py") for c in changes):
-                                    rem = deadline - monotonic()
-                                    timeout_s = min(10, max(3, int(cur_cost / 1000) + 2), max(1, int(rem)))
-                                    if rem > 1.0 and runner.verify_unittest(changes, req_ids, timeout_s=timeout_s):
-                                        required = set()
-                                        preferred = set()
-
-                workers = pack(required, ranked, durations, preferred)
-            print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")), file=output)
-    finally:
-        if runner is not None:
-            runner.close()
-        output.close()
+    # Drive output from the input inventory, even if the analysis worker stops.
+    full_json = json.dumps(full_plan, separators=(",", ":"))
+    results = None
+    for offset, path in enumerate(patches):
+        try:
+            if results is None:
+                results = bounded_results(patches[offset:], analyze, deadline)
+            analyzed, result = next(results)
+            if analyzed != path:
+                raise ValueError("analysis result is out of order")
+            workers = plan_for(path, result)
+            encoded = full_json if workers is full_plan else json.dumps(workers, separators=(",", ":"))
+        except Exception:
+            encoded = full_json
+            if results is not None:
+                with suppress(Exception):
+                    results.close()
+                results = None
+        output.write('{"commit":' + json.dumps(path.stem) + ',"workers":' + encoded + '}\n')
+    if results is not None:
+        with suppress(Exception):
+            results.close()
 
 
 import ast
 import marshal
 from pathlib import Path
-from change_shapes import (align_directives, function_body_mask, import_mask, table_entry_mask,
+from change_shapes import (align_directives, census_block_mask, function_body_mask, import_mask, table_entry_mask,
                            unchanged_call_arguments)
 from shared_writes import shared_write_effect
 from mutation_summaries import Project, module_name
@@ -164,6 +199,8 @@ def original_tree(source):
 
 
 def equal_trees(a, b, *, headers_only=False):
+    if a is b:
+        return True
     if type(a) is not type(b):
         return False
     if isinstance(a, ast.AST):
@@ -190,7 +227,8 @@ def possible_identity_change(change):
 
 
 class Index:
-    def __init__(self, data, project=None, *, narrow_shared_args=None, identity_equivalence=None, root="/sqlglot"):
+    def __init__(self, data, project=None, *, narrow_shared_args=None, identity_equivalence=None, root="/sqlglot",
+                 census_path=None):
         self.data = data
         self.project = project
         self.narrow_shared_args = (
@@ -205,6 +243,12 @@ class Index:
         self.touched_arguments = _env_flag("TOUCHED_ARGUMENTS")
         self.function_insertions = _env_flag("FUNCTION_INSERTIONS")
         self.class_table_entries = _env_flag("CLASS_TABLE_ENTRIES")
+        self.census_args = _env_flag("CENSUS_ARGS")
+        self.census_blocks = _env_flag("CENSUS_BLOCKS")
+        self.census = None
+        if (self.census_args or self.census_blocks) and census_path is not None and Path(census_path).exists():
+            from census import Census
+            self.census = Census.load(census_path)
         self.root = Path(root) if root is not None else None
         self.warm_unknown = data.get("warm_unknown", {})
         self.ids = data["ids"]
@@ -214,6 +258,26 @@ class Index:
     def bits(self, table, key):
         pointer = self.data.get(table, {}).get(key)
         return 0 if pointer is None else self.masks[pointer]
+
+    @lru_cache(maxsize=None)
+    def import_users(self, path):
+        """Recover the test import closure when no traced reader owns the module."""
+        known = self.bits("users", path)
+        if known:
+            return known
+        importing = {path}
+        graph = self.data.get("imports", {})
+        while True:
+            more = {source for source, deps in graph.items()
+                    if source not in importing and not importing.isdisjoint(deps)}
+            if not more:
+                break
+            importing.update(more)
+        mask = 0
+        for source in importing:
+            mask |= self.bits("users", source)
+        return mask | sum(1 << i for i, name in enumerate(self.ids)
+                          if name.split("::", 1)[0] in importing)
 
     def point(self, table, path, lineno):
         pointer = self.data.get(table, {}).get(path, {}).get(str(lineno))
@@ -250,7 +314,7 @@ class Index:
             mask |= b_mask
         return mask
 
-    def select_changes(self, changes):
+    def select_changes(self, changes, *, effects=None):
         if sum(len(c.added) + len(c.removed) for c in changes) > MAX_CHANGED_LINES:
             return self.all, 0
         selected = related = 0
@@ -273,14 +337,14 @@ class Index:
         if self.project is not None and (not self.fast or len(remaining) > 1):
             patch = self.project.patched(remaining, on_demand=self.fast)
         for change in remaining:
-            required, nearby = self.select(change, certificates=len(changes) == 1, patch=patch)
+            required, nearby = self.select(change, certificates=len(changes) == 1, patch=patch, effects=effects)
             selected |= required
             related |= nearby
-            if self.fast and selected == self.all:
+            if self.fast and selected == self.all and effects is None:
                 break
         return selected, related
 
-    def select(self, change, certificates=True, patch=None):
+    def select(self, change, certificates=True, patch=None, *, effects=None):
         if len(change.added) + len(change.removed) > MAX_CHANGED_LINES:
             return self.all, 0
         path = change.path
@@ -314,6 +378,10 @@ class Index:
                 after = patch.source(module).tree
             else:
                 after = ast.parse(change.after, type_comments=True)
+            census_old = census_new = None
+            if self.census is not None and self.census_args and path.startswith("sqlglot/") and certificates:
+                census_old = self.census.resolver(module, path, before)
+                census_new = self.census.resolver(module, path, after)
             if path.startswith("sqlglot/"):
                 untouched_old, untouched_new = (unchanged_call_arguments(before, after, change, equal_trees)
                                                 if self.touched_arguments and certificates else ((), ()))
@@ -327,8 +395,11 @@ class Index:
                     fresh_literals=self.touched_arguments,
                     unchanged=untouched_old,
                     pinned=self.fast,
+                    census=census_old,
                 )
                 if full_before:
+                    if effects is not None:
+                        effects[path] = None
                     return self.all, users
                 full_after, b_after = shared_write_effect(
                     after,
@@ -339,12 +410,17 @@ class Index:
                     root=self.root,
                     fresh_literals=self.touched_arguments,
                     unchanged=untouched_new,
+                    census=census_new,
                 )
                 if full_after:
+                    if effects is not None:
+                        effects[path] = None
                     return self.all, users
                 found_bindings = b_before | b_after
                 if found_bindings:
                     extra_mask = self.binding_readers(found_bindings)
+                    if effects is not None:
+                        effects[path] = extra_mask
                     if extra_mask is None:
                         return self.all, users
             same = equal_trees(before, after)
@@ -374,6 +450,12 @@ class Index:
                     readers = function_body_mask(self, change, before, shape_after, equal_trees, local_scope=True)
                     if readers is not None:
                         return opened | extra_mask | readers, users
+                # Nested code objects and captured cells only change behaviour
+                # where the edited block runs; census_block_mask rejects scope
+                # declarations, generator changes and shadowed names.
+                readers = self.census_block(change, before, shape_after, certificates)
+                if readers is not None:
+                    return opened | extra_mask | readers, users
                 return self.all, users
         if certificates and not extra_mask:
             proof = self.certificate(change, before, after, compiled, import_effect)
@@ -393,6 +475,11 @@ class Index:
         if (body_edit and change.insertions and self.function_insertions
                 and certificates):
             readers = function_body_mask(self, change, before, shape_after, equal_trees)
+            if readers is not None:
+                return opened | extra_mask | readers, users
+
+        if body_edit and change.insertions:
+            readers = self.census_block(change, before, shape_after, certificates)
             if readers is not None:
                 return opened | extra_mask | readers, users
 
@@ -431,6 +518,14 @@ class Index:
                     if overlaps(points, begin, max(end, boundary)):
                         required |= self.bits("keys", key)
         return required or self.all, users
+
+    def census_block(self, change, before, after, certificates):
+        if (self.census is None or not self.census_blocks or not certificates
+                or not change.path.startswith("sqlglot/") or before is None or after is None):
+            return None
+        resolver = self.census.resolver(module_name(change.path), change.path, after)
+        self.census_why = []
+        return census_block_mask(self, change, before, after, equal_trees, resolver, self.census_why)
 
     def certificate(self, change, before, after, compiled, import_effect):
         path = change.path

@@ -1,5 +1,5 @@
 """Place required tests first. Extras may use only existing idle milliseconds."""
-def pack(required, ranked, durations, preferred=()):
+def pack(required, ranked, durations, preferred=(), *, fill=True):
     if not required:
         return []
     ordered = [t for t in ranked if t in required]
@@ -17,6 +17,8 @@ def pack(required, ranked, durations, preferred=()):
             best_cost = cost
             best = groups
             free = [max(loads) - load for load in loads[:len(groups)]]
+    if not fill:
+        return best
     # Place zero-ms tests even on a single fully occupied worker. Then fill
     # slack with related tests first, shortest first within each priority.
     extras = sorted((t for t in ranked if t not in required),

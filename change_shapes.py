@@ -546,3 +546,81 @@ def import_mask(index, change, before, after, equal):
     for key in (name, "*"):
         mask |= int(data["from"].get(module + ":" + key, "0"), 16)
     return mask
+
+
+def _refuse(why, reason):
+    if why is not None:
+        why.append(reason)
+    return None
+
+
+_SCOPE_NODES = (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)
+
+
+def _innermost_block(fn, low, high):
+    """The innermost statement of fn whose lines contain [low, high]."""
+    node = fn
+    while True:
+        children = []
+        for field in ("body", "orelse", "finalbody"):
+            children.extend(getattr(node, field, None) or ())
+        for extra in getattr(node, "handlers", None) or ():
+            children.append(extra)
+        for case in getattr(node, "cases", None) or ():
+            children.append(case)
+        inner = next((c for c in children if hasattr(c, "body") and getattr(c, "lineno", None) is not None
+                      and c.lineno <= low and high <= c.end_lineno), None)
+        if inner is None or inner.lineno == low:
+            return inner or node
+        node = inner
+
+
+def census_block_mask(index, change, old, new, equal, resolver, why=None):
+    """An edit inside one function that passed the census-aware shared-write
+    guard on both sides is bounded by the tests that reach its innermost block.
+
+    Requires: the same function on both sides with equal headers and docstring,
+    no scope declarations, generators or awaits in the edit, no changed local
+    that an unchanged statement could read through another binding, and no
+    load of a shared mutable module or class binding in the added code.
+    """
+    a = enclosing_function(old, change.removed, change.insertions)
+    b = enclosing_function(new, change.added, change.deletions)
+    if not a or not b or a.name != b.name:
+        return _refuse(why, 'function')
+    if ast.get_docstring(a, clean=False) != ast.get_docstring(b, clean=False):
+        return _refuse(why, 'docstring')
+    saved = b.body
+    b.body = a.body
+    try:
+        if not equal(old, new):
+            return _refuse(why, 'outside body')
+    finally:
+        b.body = saved
+    added_nodes = [n for n in ast.walk(b) if getattr(n, "lineno", None) in change.added and n is not b]
+    removed_nodes = [n for n in ast.walk(a) if getattr(n, "lineno", None) in change.removed and n is not a]
+    if any(isinstance(n, _SCOPE_NODES) for n in added_nodes + removed_nodes):
+        return _refuse(why, 'scope node')
+    # A generator or coroutine changes what calling the function does.
+    def kind(fn):
+        return (isinstance(fn, ast.AsyncFunctionDef),
+                any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(fn)))
+    if kind(a) != kind(b):
+        return _refuse(why, 'generator kind')
+
+    def names(fn, ctx):
+        return {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ctx)}
+    old_names, new_names = names(a, ast.Store), names(b, ast.Store)
+    if (new_names - old_names) & names(a, ast.Load) or (old_names - new_names) & names(b, ast.Load):
+        return _refuse(why, 'shadowing')
+    if resolver.loads_shared(added_nodes, b):
+        return _refuse(why, 'shared load')
+    points = change.removed | change.insertions | {i + 1 for i in change.insertions}
+    low, high = min(points), max(points)
+    if low < a.body[0].lineno:
+        return _refuse(why, 'before body')
+    block = _innermost_block(a, low, high)
+    first, last = (a.body[0].lineno, a.end_lineno) if block is a else (block.lineno, block.end_lineno)
+    if any(first <= n <= last for n in index.warm_unknown.get("lines", {}).get(change.path, ())):
+        return _refuse(why, 'warm unknown')
+    return index.range_users(index.data["lines"].get(change.path, {}), first, last) or None

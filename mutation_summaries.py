@@ -12,10 +12,9 @@ import json
 from pathlib import Path
 import time
 
-from shared_writes import FUNCTIONS, MUTATORS, PURE_BUILTINS
+from shared_writes import FUNCTIONS, MUTATORS, PURE_BUILTINS, SCOPES, scope_members as members
 from patching import overlaps
 
-SCOPES = (*FUNCTIONS, ast.ClassDef)
 MISSING = object()
 RETAINING_BUILTINS = frozenset("iter sorted list dict tuple set frozenset min max sum "
                                "enumerate zip map filter getattr type".split())
@@ -50,22 +49,6 @@ class WorkBudget:
 def module_name(path):
     parts = Path(path).with_suffix("").parts
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
-
-
-def members(node):
-    """Yield this scope's nodes, visiting nested headers but not nested bodies."""
-    body = node.body if isinstance(node.body, list) else [node.body]
-    pending = list(body)
-    while pending:
-        child = pending.pop()
-        yield child
-        if isinstance(child, SCOPES):
-            for field, value in ast.iter_fields(child):
-                if field != "body":
-                    pending.extend(item for item in (value if isinstance(value, list) else [value])
-                                   if isinstance(item, ast.AST))
-        else:
-            pending.extend(ast.iter_child_nodes(child))
 
 
 def signature(fn):

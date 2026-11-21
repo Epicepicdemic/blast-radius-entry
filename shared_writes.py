@@ -10,6 +10,7 @@ from types import MappingProxyType
 from patching import MAX_CHANGED_LINES, overlaps
 
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+SCOPES = (*FUNCTIONS, ast.ClassDef)
 FRESH_BUILTINS = {"dict", "list", "set", "bytearray"}
 
 # Start with the actual method inventories. Immutable counterparts supply the
@@ -35,6 +36,62 @@ PURE_BUILTINS = frozenset(
 )
 PURE_CALLS = {f"builtins.{name}" for name in PURE_BUILTINS}
 OPERATOR_CALLS = {f"operator.{name}" for name in OPERATOR_WRITES}
+
+
+def scope_members(sc):
+    """Walk one lexical scope, including nested headers and excluding nested bodies."""
+    body = sc.body if isinstance(sc.body, list) else [sc.body]
+    pending = list(body)
+    while pending:
+        child = pending.pop()
+        yield child
+        if isinstance(child, SCOPES):
+            for field, value in ast.iter_fields(child):
+                if field != "body":
+                    pending.extend(
+                        item for item in (value if isinstance(value, list) else [value])
+                        if isinstance(item, ast.AST)
+                    )
+        else:
+            pending.extend(ast.iter_child_nodes(child))
+
+
+
+def _class_qualnames(parents, module):
+    names = {}
+    for node in parents:
+        if isinstance(node, ast.ClassDef):
+            chain = [node.name]
+            parent = parents[node]
+            while isinstance(parent, ast.ClassDef):
+                chain.append(parent.name)
+                parent = parents[parent]
+            local = '.'.join(reversed(chain))
+            names[node] = f'{module}.{local}' if module else local
+    return names
+
+
+def _hierarchy(tree, module):
+    parents = {tree: None}
+    scopes = [tree]
+    while scopes:
+        scope = scopes.pop()
+        for child in scope_members(scope):
+            if isinstance(child, SCOPES):
+                parents[child] = scope
+                scopes.append(child)
+    return parents, _class_qualnames(parents, module)
+
+
+_pinned_hierarchy = lru_cache(maxsize=32)(_hierarchy)
+
+
+def statement_children(node):
+    """Statement suites can contain imports and declarations. Expressions cannot."""
+    for field in ('body', 'orelse', 'handlers', 'finalbody', 'cases'):
+        children = getattr(node, field, ())
+        if isinstance(children, list):
+            yield from children
 
 
 def bindings(tree):
@@ -99,7 +156,7 @@ _pinned_bindings = lru_cache(maxsize=32)(bindings)
 
 
 def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_args=False, root=None,
-                        *, fresh_literals=False, unchanged=(), pinned=False):
+                        *, fresh_literals=False, unchanged=(), pinned=False, census=None):
     if len(changed) > MAX_CHANGED_LINES:
         return True, set()
     if not changed:
@@ -116,7 +173,10 @@ def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_
     @cache
     def imported_names():
         imports = {}
-        for node in ast.walk(tree):
+        pending = [tree]
+        while pending:
+            node = pending.pop()
+            pending.extend(statement_children(node))
             if isinstance(node, ast.Import):
                 imports.update((alias, alias.name) for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.level == 0:
@@ -227,38 +287,11 @@ def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_
 
     @cache
     def _scope_tree():
-        parents = {tree: None}
-        class_q = {}
-
-        def visit(sc, cls_chain):
-            for child in _members(sc):
-                if isinstance(child, (*FUNCTIONS, ast.ClassDef)):
-                    parents[child] = sc
-                    if isinstance(child, ast.ClassDef):
-                        chain = (*cls_chain, child.name)
-                        class_q[child] = f"{module}.{'.'.join(chain)}" if module else ".".join(chain)
-                        visit(child, chain)
-                    else:
-                        visit(child, ())
-
-        visit(tree, ())
-        return parents, class_q
-
-    def _members(sc):
-        body = sc.body if isinstance(sc.body, list) else [sc.body]
-        pending = list(body)
-        while pending:
-            child = pending.pop()
-            yield child
-            if isinstance(child, (*FUNCTIONS, ast.ClassDef)):
-                for field, value in ast.iter_fields(child):
-                    if field != "body":
-                        pending.extend(
-                            item for item in (value if isinstance(value, list) else [value])
-                            if isinstance(item, ast.AST)
-                        )
-            else:
-                pending.extend(ast.iter_child_nodes(child))
+        source = getattr(project, 'sources', {}).get(module)
+        if source is not None and source.tree is tree:
+            return source.parents, _class_qualnames(source.parents, module)
+        hierarchy = _pinned_hierarchy if pinned else _hierarchy
+        return hierarchy(tree, module)
 
     def _resolve_relative(level, mod_name):
         if level == 0:
@@ -297,7 +330,7 @@ def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_
         defs = defaultdict(list)
         has_dynamic = False
 
-        for node in _members(sc):
+        for node in scope_members(sc):
             if isinstance(node, ast.Global):
                 globals_.update(node.names)
             elif isinstance(node, ast.Nonlocal):
@@ -384,7 +417,7 @@ def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_
         mtree = _module_ast(mod_name)
         if mtree is None:
             return None
-        for node in _members(mtree):
+        for node in scope_members(mtree):
             if isinstance(node, ast.ClassDef) and node.name == sym_name:
                 return "class"
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == sym_name:
@@ -828,6 +861,10 @@ def shared_write_effect(tree, changed, project=None, module=None, narrow_shared_
                         for arg, _ in shared_risky:
                             classified = _classify_arg(arg, scope, comp_vars)
                             if classified is None:
+                                # The heap census can show that this value is
+                                # never a shared object at the pin.
+                                if census is not None and census(arg, scope, cls, node, tree):
+                                    continue
                                 return True
                             found_bindings.update(classified)
 

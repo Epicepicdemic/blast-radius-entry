@@ -2,17 +2,9 @@
 !builder/
 !builder/**
 !maps.json
-!selector.py
-!patching.py
-!packing.py
-!proofs.py
-!shared_writes.py
-!mutation_summaries.py
-!bounded_batch.py
-!runner.py
-!change_shapes.py
-!import_readers.py
-!pinned_data.py
-!table_readers.py
+!census_params.json
+# The entry COPY names each runtime module explicitly. Allow root Python
+# sources so adding a module there does not require a second file-list edit.
+!/*.py
 **/__pycache__/
 **/*.pyc

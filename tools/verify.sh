@@ -24,7 +24,7 @@ assert set(maps["skipped"]) == set(manifest["skipped"])
 print("Baseline matched test inventory:", len(maps["ids"]), "passing,", len(maps["skipped"]), "skipped")
 PY
 start=$SECONDS
-timeout 600 docker buildx build --platform linux/amd64 --load --no-cache --tag br-entry .
+timeout 600 docker build --no-cache --platform linux/amd64 -t br-entry .
 echo "Clean entry build took $((SECONDS-start)) s"
 flags=(--rm --platform linux/amd64 --network none --cpus 2 --memory 4096m --memory-swap 4096m
        --pids-limit 256 --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL

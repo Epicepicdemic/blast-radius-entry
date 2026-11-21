@@ -1,10 +1,10 @@
 # Blast Radius
 
-A static test selector for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It reads independent unified diffs and the numbered test manifest in `/data`, then prints one JSON object per commit.
+A coverage-guided test selector with a bounded unittest verifier for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It reads independent unified diffs and the numbered test manifest in `/data`, then prints one JSON object per commit.
 
 ## How selection works
 
-The image contains a static selector and a dependency index measured on the unmodified commit. The runtime manifest supplies test numbers and prices. The selector validates hunk coordinates and old bytes, applies each patch independently in memory, and compiles Python with the pinned interpreter.
+The image contains a dependency index measured on the unmodified commit, a static selector and a forked verifier. The runtime manifest supplies test numbers and prices. The selector validates hunk coordinates and old bytes, applies each patch independently in memory, and compiles Python with the pinned interpreter.
 
 The offline collector uses the kit’s Python image, exact package lock and `SKIP_INTEGRATION=0`. It records CPython line and lambda-entry events, source and fixture opens, pytest fixture scopes, imports, and work in spawned Python processes and pool tasks. Module initialization and collection can publish objects through global registries. An observed dependency during either phase is charged to the whole suite. Pool serialization outside the task belongs to the pool’s submitters. Unrecognized runtime test IDs are mandatory.
 
@@ -12,7 +12,7 @@ Two additional cold pytest runs trace the complete TPC-DS executor and parser no
 
 The collector also starts a fresh Python interpreter for every passing node in the manifest. One node owns all events from startup through teardown and worker shutdown, including source executed by imports and shared fixtures. A later consumer of a process-wide cache therefore records its own first read and initialization. The reducer unions these observations with the suite and case traces and recomputes derived source readers from the combined line masks. The general line and data-file rules retain the full-suite fallback for sites absent from the original suite and case traces. Every isolated run must pass before the collector writes the combined index.
 
-For each Python change under `sqlglot/`, the selector inspects removed lines in the original syntax tree and added lines in the reconstructed tree. A changed line in an assignment or mutating call on potentially shared state selects the full suite before syntax equality, certificates or line coverage. A later test can read the modified object without ever executing the write. This check includes module bindings, explicit global and nonlocal writes, class receivers, subscript writes, `setattr`, and in-place collection operations. A multiline operation includes its arguments or assigned value. Plain class-body declarations continue through the existing reader maps. Mutating calls within their values still count.
+The first selection stage establishes the original static bound. For each Python change under `sqlglot/`, the selector inspects removed lines in the original syntax tree and added lines in the reconstructed tree. A changed line in an assignment or mutating call on potentially shared state selects the full suite before syntax equality, certificates or line coverage. A later test can read the modified object without ever executing the write. This check includes module bindings, explicit global and nonlocal writes, class receivers, subscript writes, `setattr`, and in-place collection operations. A multiline operation includes its arguments or assigned value. Plain class-body declarations continue through the existing reader maps. Mutating calls within their values still count.
 
 Direct assignment to an ordinary instance receiver, such as `self.field = value`, writes the instance. The expression `self.field.update(...)` or `self.field[key] = value` can change a container inherited from the class, and `self.field += value` can invoke an in-place operator on it. All three select the suite. The receiver exemption uses the first positional parameter of a plain instance method, regardless of its name. Class methods, implicit class receivers such as `__new__`, metaclass methods, and unresolved decorators or base classes receive conservative treatment. The selector also recognizes function-local containers created by literals, comprehensions, or unshadowed built-in constructors. An unresolved alias or parameter used as a mutation receiver selects the suite.
 
@@ -20,13 +20,23 @@ The selector derives mutating methods from Python’s mutable container types, i
 
 At image build time, `mutation_summaries.py` parses every Python module in the pinned SQLGlot package. Each function, method and lambda gets a parameter signature and a mask of possible writes or escapes. The analysis follows local aliases, assignments through objects, in-place operators, container and closure captures, returned arguments and calls through callbacks. A direct getter can return an element. Its caller can still receive a shared object. An unresolved call marks its arguments and receiver inside the calling function. A worklist propagates these effects back to callers until recursive groups reach a fixed point.
 
-At selection time, a unique project binding can exempt individual arguments whose receiving parameters have no recorded effect. The resolver follows direct imports, re-exports and unambiguous aliases. It binds positional-only and keyword-only parameters and includes every parameter an unpack can reach. Rebindings, opaque decorators, unresolved instance or constructor dispatch and ambiguous targets preserve the previous shared-argument check. Enclosing calls and nested calls are each checked. A full-suite decision on either side of the patch takes precedence.
+At selection time, a unique project binding can exempt individual arguments whose receiving parameters have no recorded effect. The resolver follows direct imports, re-exports and unambiguous aliases. It binds positional-only and keyword-only parameters and includes every parameter an unpack can reach. Rebindings, opaque decorators, unresolved instance or constructor dispatch and ambiguous targets preserve the previous shared-argument check. Enclosing calls and nested calls are each checked. A full-suite decision on either side establishes the starting bound for the function coverage check.
 
 The pinned image contains the original summaries and their call constraints. Each diff gets its own view of the changed modules. The selector recomputes summaries for touched definitions and resolves transitive calls against every file in that diff. Static analysis reads the reconstructed source. Live verification can later run selected tests against it in a child process.
 
 The selector sends the full suite for a patch over 1 MiB or over 2,000 added and removed lines combined across files. It checks byte size before opening the patch and counts edits before parsing Python. The shared-write check uses binary search on changed line numbers. Each function summary has a bounded work allowance for syntax visits and alias propagation. Exceeding it marks every parameter as possibly mutated. Patched modules and their call graph also share an aggregate work allowance.
 
 A separate worker analyzes one commit at a time. The parent gives it up to three wall-clock seconds per commit and up to 150 seconds across the batch, including map loading. A timed-out commit gets the precomputed full-suite plan. The parent can restart the worker for the next commit. When the batch deadline expires, it emits full plans for the unresolved remainder.
+
+### Function coverage and verification
+
+When the static stage reaches the whole suite, the selector matches enclosing declarations on both sides of the patch. A change confined to existing function bodies uses the union of their original line coverage, source and code readers, and identifiable persistent-state readers. This includes insertions and changes to local scope. A function with missing coverage uses its module’s importers. An unsupported declaration, an unresolved write target or an import-time side effect can retain the suite. SQL fixture candidates come from recorded file reads.
+
+The batch parent imports unittest before SQLGlot and preloads the numbered tests in file order. Each verification runs in a fresh process group. A meta-path loader compiles the patched bytes in memory. A function body can be replaced on all resident function objects when it was idle throughout initialization, has compatible closure bindings and has an eligible header. Other source changes rebuild the project and test modules inside that fork. SQL text fixtures use memory-backed descriptors. A passing case must read each changed fixture to clear it.
+
+The child uses one unittest suite in file order so class fixtures, teardown, and subtest failures participate in the verdict. It hashes watched module and class bindings before and after the run. A changed binding adds its recorded readers. An unresolved shared write requires every potential writer to run on both the pristine and patched sources. The children compare module and class state after each writer and after teardown, including bindings reached through aliases. A missing writer, unbounded cost or unidentified reader can restore the whole suite. The selector retains unrun, skipped, failing and errored cases and protects tests with unsupported process, source-read or allocation behavior. Serialization edits also retain pinned pool and pickle consumers. A process failure, failed import, fixture failure or timeout discards the child’s passes.
+
+The parent estimates the best possible scheduling saving before forking. It chooses a deterministic subset from manifest durations, enforces a five-second CPU allowance shared with static analysis, apportions the allowance for larger batches, and uses the 150-second batch deadline. On exit it kills the child process group and reaps its descendants.
 
 ### Rules that can omit a test
 
@@ -59,13 +69,11 @@ Each switch defaults to 1 and accepts a Docker build argument or a runtime envir
 | `UNUSED_IMPORTS` | Checks a single added or removed module-level alias for unused or re-exported names. Includes binding readers and importers that request the name or use a star import. |
 | `FAST_ANALYSIS` | Loads image-built binary indexes, reuses pinned binding facts, and stops analysis once a full-suite decision is known. |
 | `NARROW_SHARED_ARGS` | Resolves possibly shared arguments and includes known binding readers. A shared binding without reader evidence selects the suite. |
-| `ISOLATION_DROP` | Runs eligible small unittest selections in an isolated child. Passing selections can be dropped. |
-| `ENGINE_SKIP` | Replays the TPC-DS frontend on eligible changes before dropping the executor test. |
 | `IDENTITY_EQUIVALENCE` | Checks whether a single identity/equality comparison has the same result for the pinned class or enum. |
 
 ### Worker placement
 
-Longest-processing-time-first packing prices one through eight workers in integer milliseconds. The least expensive plan keeps every required test. All zero-duration tests join a nonempty plan. Related tests have priority when filling space below the busiest worker’s load.
+Longest-processing-time-first packing prices one through eight workers in integer milliseconds. The entry emits the cheapest layout for the required tests.
 
 ## Reproduce
 
@@ -95,3 +103,7 @@ The image installs the following distributions at the versions in [the official 
 ## License
 
 [MIT](LICENSE).
+
+## Release verification
+
+Clone the pushed private branch into a fresh directory and run `docker build --no-cache --platform linux/amd64 .` inside that clone. Run the resulting image with the starter kit’s `RUN_FLAGS` and score its stdout against the sample answers. An archive build can provide a separate resource measurement. The directory build exercises the scorer’s Docker context and ignore rules.

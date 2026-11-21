@@ -20,9 +20,16 @@ WORKDIR /sqlglot
 ENV PYTHONPATH=/builder:/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHON_CPU_COUNT=4
 CMD ["python", "/builder/collect.py"]
 
+# Offline heap census of the pinned suite (no patches), like the tracer:
+#   docker build --target census -t br-census . && docker run -v "$PWD/scratch/census:/out" br-census
+#   python census.py merge scratch/census census_params.json
+FROM dependencies AS census
+COPY builder/ /builder/
+WORKDIR /sqlglot
+ENV PYTHONPATH=/builder:/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHON_CPU_COUNT=4
+CMD ["sh", "-c", "python /builder/census_run.py /sqlglot /out 6 || touch /out/FAILED"]
+
 FROM dependencies AS entry
-ARG ISOLATION_DROP=1
-ARG ENGINE_SKIP=1
 ARG NARROW_SHARED_ARGS=1
 ARG CLASS_TABLE_ENTRIES=1
 ARG FUNCTION_INSERTIONS=1
@@ -31,17 +38,20 @@ ARG LOCAL_SCOPE_CHANGES=1
 ARG UNUSED_IMPORTS=1
 ARG FAST_ANALYSIS=1
 ARG IDENTITY_EQUIVALENCE=1
-ENV FAST_ANALYSIS=$FAST_ANALYSIS \
+ARG CENSUS_ARGS=1
+ARG CENSUS_BLOCKS=1
+ENV CENSUS_ARGS=$CENSUS_ARGS \
+    CENSUS_BLOCKS=$CENSUS_BLOCKS \
+    FAST_ANALYSIS=$FAST_ANALYSIS \
     UNUSED_IMPORTS=$UNUSED_IMPORTS \
     LOCAL_SCOPE_CHANGES=$LOCAL_SCOPE_CHANGES \
     TOUCHED_ARGUMENTS=$TOUCHED_ARGUMENTS \
     FUNCTION_INSERTIONS=$FUNCTION_INSERTIONS \
     CLASS_TABLE_ENTRIES=$CLASS_TABLE_ENTRIES \
-    ISOLATION_DROP=$ISOLATION_DROP \
-    ENGINE_SKIP=$ENGINE_SKIP \
     NARROW_SHARED_ARGS=$NARROW_SHARED_ARGS \
     IDENTITY_EQUIVALENCE=$IDENTITY_EQUIVALENCE
+ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 WORKDIR /app
-COPY maps.json selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py runner.py change_shapes.py table_readers.py import_readers.py pinned_data.py ./
-RUN python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json && python -m compileall -q /app
+COPY snapshot_cone.py import_state.py maps.json selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json ./
+RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
 CMD ["python", "/app/selector.py"]
