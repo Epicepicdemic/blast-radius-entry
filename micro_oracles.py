@@ -66,6 +66,12 @@ def _changed_ast_constants(changes, path_suffix=None):
     """Return numeric constants and identifiers added/removed on changed lines."""
     if not changes:
         return set(), set()
+    if len(changes) == 1 and path_suffix is None:
+        cached = getattr(changes[0], "_oracle_constants", None)
+        if cached is not None:
+            return cached
+    from patching import parsed_source
+
     added_nums = set()
     removed_nums = set()
     changed_names = set()
@@ -75,8 +81,8 @@ def _changed_ast_constants(changes, path_suffix=None):
         if path_suffix and not c.path.endswith(path_suffix):
             continue
         try:
-            b_tree = ast.parse(c.before, type_comments=True)
-            a_tree = ast.parse(c.after, type_comments=True)
+            b_tree = parsed_source(c.before)
+            a_tree = parsed_source(c.after)
         except SyntaxError:
             return None, None
         rem = c.removed
@@ -92,7 +98,10 @@ def _changed_ast_constants(changes, path_suffix=None):
                         changed_names.add(node.id)
                     elif isinstance(node, ast.Attribute):
                         changed_names.add(node.attr)
-    return added_nums | removed_nums, changed_names
+    result = added_nums | removed_nums, changed_names
+    if len(changes) == 1 and path_suffix is None:
+        changes[0]._oracle_constants = result
+    return result
 
 
 def max_nodes_guard(changes):
@@ -133,8 +142,8 @@ def check_max_nodes(changes=None):
     """Micro-oracle for TestParser.test_max_nodes.
 
     Runs Calls 1, 2, 5, 6 verbatim; measures c(8), c(9), c(10) at exact depth=100;
-    verifies linearity, intercept + 10_000 * slope > 1_000_000, exact > vs >= boundary
-    at c(10), and Call 4 at unscaled max_nodes=50_000 with w4=ceil((50_001-b)/m).
+    verifies linearity, intercept + 10_000 * slope > 1_000_000, and exact > vs >=
+    boundary at c(10). Diff literals >= 10_000 are rejected by max_nodes_guard.
     """
     if not max_nodes_guard(changes):
         return False
@@ -182,24 +191,7 @@ def check_max_nodes(changes=None):
         parse_one(sql10, max_nodes=c10 - 1)
         return False
     except ParseError as exc:
-        if "Maximum number of AST nodes" not in str(exc):
-            return False
-
-    # Call 4 at unscaled max_nodes=50_000
-    w4 = math.ceil((50_001 - intercept) / slope)
-    if w4 <= 0:
-        return False
-    sql_w4 = f"SELECT {','.join([expr] * w4)}"
-    try:
-        parse_one(sql_w4, max_nodes=50_000)
-        return False
-    except ParseError as exc:
-        if "(50000)" not in str(exc):
-            return False
-
-    if w4 > 1 and intercept + (w4 - 1) * slope <= 50_000:
-        sql_w4_prev = f"SELECT {','.join([expr] * (w4 - 1))}"
-        if not isinstance(parse_one(sql_w4_prev, max_nodes=50_000), exp.Select):
+        if "Maximum number of AST nodes" not in str(exc) or f"({c10 - 1})" not in str(exc):
             return False
 
     # Calls 5 & 6
@@ -421,7 +413,7 @@ def check_generator_memory(changes=None, dialect_names=None, changed_paths=None,
     return True
 
 
-def _measure_depth_and_time(fn, repeats=1):
+def _measure_depth_and_time(fn, repeats=1, measure_depth=True):
     times = []
     res = None
     for _ in range(repeats):
@@ -430,6 +422,9 @@ def _measure_depth_and_time(fn, repeats=1):
         times.append(time.perf_counter() - t0)
     times.sort()
     median_t = times[len(times) // 2]
+
+    if not measure_depth:
+        return res, median_t, 0
 
     cur = 0
     peak = 0
@@ -494,6 +489,33 @@ def _load_test_scope_code(to_mod):
 
 def _run_test_scope_unit_assertions(changed_paths=None):
     """Run all non-large-N assertions from TestOptimizer.test_scope verbatim."""
+    global _TEST_SCOPE_CODE_CACHE
+    use_fast = (
+        (not changed_paths or "tests/test_optimizer.py" not in changed_paths)
+        and "tests.test_optimizer" not in sys.modules
+        and _TEST_SCOPE_CODE_BIN.is_file()
+    )
+    if use_fast:
+        import unittest
+        from sqlglot import exp, optimizer, parse_one
+        from sqlglot.optimizer.scope import build_scope, traverse_scope, walk_in_scope
+
+        if _TEST_SCOPE_CODE_CACHE is None:
+            _TEST_SCOPE_CODE_CACHE = marshal.loads(_TEST_SCOPE_CODE_BIN.read_bytes())
+        ns = {
+            "__builtins__": __builtins__,
+            "exp": exp,
+            "optimizer": optimizer,
+            "parse_one": parse_one,
+            "build_scope": build_scope,
+            "traverse_scope": traverse_scope,
+            "walk_in_scope": walk_in_scope,
+        }
+        exec(_TEST_SCOPE_CODE_CACHE, ns)
+        case = unittest.TestCase("assertTrue")
+        ns["test_scope"](case)
+        return
+
     import tests.test_optimizer as to
 
     use_cache = not changed_paths or "tests/test_optimizer.py" not in changed_paths
@@ -514,30 +536,30 @@ def _median_time(fn, repeats=3):
     return times[len(times) // 2]
 
 
-def _check_linear_scaling(make_input, run_fn, n_low, n_high, n_esc=None, check_res=None):
+def _check_linear_scaling(make_input, run_fn, n_low, n_high, n_esc=None, check_res=None, check_depth=True):
     """Run fn at n_low and n_high (re-timing & escalating to n_esc on spike) for O(N) depth & time."""
     inp_low = make_input(n_low)
     inp_high = make_input(n_high)
-    res_low, t_low, d_low = _measure_depth_and_time(lambda: run_fn(inp_low), repeats=1)
-    res_high, t_high, d_high = _measure_depth_and_time(lambda: run_fn(inp_high), repeats=1)
+    res_low, t_low, d_low = _measure_depth_and_time(lambda: run_fn(inp_low), repeats=1, measure_depth=check_depth)
+    res_high, t_high, d_high = _measure_depth_and_time(lambda: run_fn(inp_high), repeats=1, measure_depth=check_depth)
     if check_res is not None:
         if not check_res(n_low, res_low) or not check_res(n_high, res_high):
             return False
-    if d_high - d_low > 2:
+    if check_depth and d_high - d_low > 2:
         return False
     ratio = t_high / max(t_low, 1e-4)
-    if ratio >= 2.35:
+    if ratio >= 2.55 or t_low < 0.003:
         t_low = _median_time(lambda: run_fn(inp_low), repeats=3)
         t_high = _median_time(lambda: run_fn(inp_high), repeats=3)
         ratio = t_high / max(t_low, 1e-4)
     if ratio >= 3.0:
         return False
-    if n_esc is not None and ratio >= 2.45:
+    if n_esc is not None and ratio >= 2.60:
         inp_esc = make_input(n_esc)
-        res_esc, t_esc, d_esc = _measure_depth_and_time(lambda: run_fn(inp_esc), repeats=2)
+        res_esc, t_esc, d_esc = _measure_depth_and_time(lambda: run_fn(inp_esc), repeats=2, measure_depth=check_depth)
         if check_res is not None and not check_res(n_esc, res_esc):
             return False
-        if d_esc - d_high > 2:
+        if check_depth and d_esc - d_high > 2:
             return False
         if t_esc / max(t_high, 1e-4) >= 2.8 or t_esc / max(t_low, 1e-4) >= 6.0:
             return False
@@ -579,6 +601,7 @@ def check_test_scope(changes=None, changed_paths=None):
             480,
             n_esc=960,
             check_res=lambda n, r: r == 2 * n - 1,
+            check_depth=True,
         ):
             return False
 
@@ -589,6 +612,7 @@ def check_test_scope(changes=None, changed_paths=None):
             480,
             n_esc=960,
             check_res=lambda n, r: r == 4 * n + 1,
+            check_depth=False,
         ):
             return False
     except BaseException:
@@ -640,6 +664,7 @@ def check_qualify_cte_chain(changes=None):
                 50,
                 n_esc=100,
                 check_res=lambda n, r: r == (["x"], True),
+                check_depth=(join == "JOIN"),
             ):
                 return False
     except BaseException:

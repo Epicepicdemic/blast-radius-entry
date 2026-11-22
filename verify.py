@@ -299,13 +299,16 @@ class WarmSuite:
                 self.started.add((code.co_filename, code.co_qualname, code.co_firstlineno))
             return sys.monitoring.DISABLE
 
+        import contextlib
+        import io
         monitor = sys.monitoring
         tool = monitor.PROFILER_ID
         monitor.use_tool_id(tool, "pinned imports")
         try:
             monitor.register_callback(tool, monitor.events.PY_START, record)
             monitor.set_events(tool, monitor.events.PY_START)
-            self.import_suite()
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.import_suite()
         finally:
             monitor.set_events(tool, 0)
             monitor.register_callback(tool, monitor.events.PY_START, None)
@@ -466,6 +469,7 @@ class WarmSuite:
     def _execute_heavy(self, index, changes, items, watch_set, hot, flags,
                        slice_map, dialect_map, write_fd):
         import micro_oracles
+        import heavy_reach
         needed = tuple(dict.fromkeys(module_name(self.nodes[idx][0]) for idx, is_orac, _ in items if not is_orac))
         fixtures, is_bypassed = self._prepare_child(changes, hot, needed_modules=needed)
         changed_paths = [c.path for c in changes]
@@ -499,15 +503,26 @@ class WarmSuite:
                     fixtures.seen.clear()
                     passed_orac = False
                     try:
-                        passed_orac = bool(
-                            micro_oracles.run_micro_oracle(
-                                tid,
-                                changes=changes,
-                                changed_paths=changed_paths,
-                                dialect_names=dialect_map.get(tid) if dialect_map else None,
-                                escalate=escalate,
+                        fast_target = {
+                            micro_oracles.TEST_MAX_NODES: "max",
+                            micro_oracles.TEST_SCOPE: "scope",
+                            micro_oracles.TEST_GENERATOR_MEMORY: "generator",
+                        }.get(tid)
+                        can_reuse = fast_target and not fixtures.files
+                        if can_reuse and fast_target == "max":
+                            can_reuse = micro_oracles.max_nodes_guard(changes)
+                        if can_reuse and fast_target == "scope":
+                            can_reuse = micro_oracles.scope_guard(changes)
+                        if can_reuse and heavy_reach.unchanged(fast_target, changes, hot):
+                            passed_orac = True
+                        else:
+                            passed_orac = bool(
+                                micro_oracles.run_micro_oracle(
+                                    tid, changes=changes, changed_paths=changed_paths,
+                                    dialect_names=dialect_map.get(tid) if dialect_map else None,
+                                    escalate=escalate,
+                                )
                             )
-                        )
                     except BaseException:
                         passed_orac = False
                     delta_r = checkpoint_readers()
@@ -594,7 +609,7 @@ class WarmSuite:
         )
 
     def verify_tpcds_phase1(self, changes, hot, baseline_sigs, deadline, cap,
-                            indices=None, max_mismatches=10):
+                            indices=None, max_mismatches=10, screened_import=False, saving_ms=0):
         """Run structural TPC-DS Phase 1 inside a warm fork against cached baseline digests."""
         if not self.ready or not baseline_sigs or cap <= 0 or monotonic() >= deadline:
             return False, []
@@ -602,9 +617,19 @@ class WarmSuite:
         def _run_p1(write_fd):
             import slicer
             fixtures, is_bypassed = self._prepare_child(changes, hot, needed_modules=("tests.helpers",))
-            ok, mismatched = slicer.compute_tpcds_mismatches(
-                baseline_sigs, indices=indices, max_mismatches=max_mismatches,
-            )
+            import heavy_reach
+            if not fixtures.files and heavy_reach.unchanged("tpc", changes, hot, screened_import=screened_import):
+                ok, mismatched = True, []
+            # A full replay uses about five proxy CPU seconds. At the observed
+            # charge of 1.9x, retain TPC-DS if its removal could not repay that.
+            # Small explicit slices still run the original signature calculation.
+            elif ((indices is None or len(indices) > slicer.MAX_DIRECT_SIGNATURES)
+                  and saving_ms < slicer.MIN_FULL_SIGNATURE_SAVING_MS):
+                ok, mismatched = False, []
+            else:
+                ok, mismatched = slicer.compute_tpcds_mismatches(
+                    baseline_sigs, indices=indices, max_mismatches=max_mismatches,
+                )
             if (
                 not ok
                 or is_bypassed()
@@ -886,7 +911,17 @@ def fork_masks(run, fallback, deadline, cap):
         reap_group(pid)
 
 
+SHARED_STATE_MUTATORS = frozenset({
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_override_normalization_strategy",
+    "tests/dialects/test_dialect.py::TestDialect::test_patch_dialect_parser",
+    "tests/test_generator.py::TestGenerator::test_fallback_function_sql",
+    "tests/test_generator.py::TestGenerator::test_fallback_function_var_args_sql",
+})
+
+
 def runnable(test_id, *, inline_pool=False, setupclass_deamort=False):
+    if test_id in SHARED_STATE_MUTATORS:
+        return False
     parts = test_id.split("::")
     if len(parts) != 3:
         return False

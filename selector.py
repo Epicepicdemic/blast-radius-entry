@@ -75,7 +75,7 @@ def load_index(root):
 def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
     from bounded_batch import BATCH_SECONDS
     from cone import analyze as candidates, serialization_edit
-    from packing import pack
+    from packing import pack, packed_cost
     from patching import read_patch
     from snapshot_cone import ImportSnapshot, runtime_readers
     from state_watch import persistent_readers
@@ -90,6 +90,7 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
     use_gen_mem_escalate = _env_flag("GEN_MEM_ESCALATE", True)
     use_isolated_schedule = _env_flag("ISOLATED_SCHEDULE", True)
     use_reach_gate = _env_flag("REACH_GATE", True)
+    big_only = _env_flag("HEAVY_BIG_ONLY", False)
     heavy_enabled = any((
         use_inline_pool,
         use_micro_oracles,
@@ -136,6 +137,9 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
     def get_case_cov():
         if not case_cov_holder[0]:
             case_cov_holder[0] = True
+            # Child forks share the decoded, read-only observations for the batch.
+            import heavy_reach
+            heavy_reach.footprints()
             from pinned_data import load
             from slicer import CaseCoverage
             cc_path = Path(__file__).with_name("case-coverage.json")
@@ -170,12 +174,10 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
         use_snapshot = runtime_readers(index, changes, equal_trees) if selected == protected == index.all else None
         return selected, protected, watches, hot, writers, use_snapshot, process_time() - start
 
+    positive_rank = [t for t in ranked if durations[t] > 0]
+
     def cost(tests_set):
-        if not tests_set:
-            return 0
-        workers = pack(tests_set, ranked, durations, fill=False)
-        return 2000 * len(workers) + max(
-            (sum(durations[t] for t in w) for w in workers), default=0)
+        return packed_cost(tests_set, positive_rank, durations)
 
     def _vanilla_verify(selected, protected, watch, hot, writers, path, static_cpu):
         remaining_cpu = cap - static_cpu
@@ -204,6 +206,7 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
         return passed, extra
 
     def plan_for(path, result):
+        screened_import = False
         if result is not None and result[5] is not None and suite.ready and monotonic() < deadline:
             selected, protected, watch, hot, writers, (eager_importers, runtime_required), static_cpu = result
             if not snapshot.ready:
@@ -212,6 +215,7 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
             changes = read_patch(path, root)
             cap_left = cap - static_cpu - ((cgroup_cpu() or 0) - (start_cpu or 0))
             selected, protected = snapshot.select(changes, deadline, cap_left)
+            screened_import = protected != index.all
             selected |= eager_importers | runtime_required
             protected |= runtime_required
             if any(serialization_edit(c) for c in changes):
@@ -295,8 +299,15 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
                                     mismatched = []
                                     if p1_cands is None or p1_cands:
                                         rem_p1 = deadline - monotonic()
-                                        p1_cap = min(8.0, max(1.0, (rem_p1 - 1.5) * 0.4))
+                                        p1_cap = min(12.0, max(1.0, (rem_p1 - 1.5) * 0.4))
                                         if rem_p1 > 1.5:
+                                            # Other expensive candidates can also clear in this commit.
+                                            # Price TPC-DS with them present and with only protected tests left.
+                                            blocked = translate(selected & protected) | unknown
+                                            if blocked:
+                                                blocked.update(reverse_failures)
+                                            tpc_floor = blocked | reverse_failures | {tpcds_num}
+                                            attainable_saving = max(tpcds_marginal, cost(tpc_floor) - cost(blocked))
                                             ok_p1, mismatched = suite.verify_tpcds_phase1(
                                                 changes,
                                                 hot,
@@ -304,6 +315,8 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
                                                 deadline,
                                                 p1_cap,
                                                 indices=p1_cands,
+                                                screened_import=screened_import,
+                                                saving_ms=attainable_saving,
                                                 max_mismatches=max(0, 10 - len(p2)),
                                             )
                                         else:
@@ -352,6 +365,10 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
                         if i == tpcds_idx:
                             continue
                         tid = index.ids[i]
+                        if big_only and (tid in micro_oracles.MICRO_ORACLE_IDS or not runnable(tid)
+                                         or tid.startswith("tests/test_optimizer.py::")) and tid != micro_oracles.TEST_MAX_NODES:
+                            excluded.add(i)
+                            continue
                         if tid in micro_oracles.MICRO_ORACLE_IDS:
                             if micro_oracles.micro_oracle_guard(
                                 tid,
@@ -370,20 +387,20 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
                                 if use_reach_gate:
                                     o_est = 35
                                     if tid == micro_oracles.TEST_MAX_NODES:
-                                        o_est = 1600
-                                    elif tid == micro_oracles.TEST_SCOPE:
-                                        o_est = 550
-                                    elif tid == micro_oracles.TEST_QUALIFY_CTE_CHAIN:
-                                        o_est = 660
-                                    elif tid == micro_oracles.TEST_DEEP_AST_ANNOTATION:
-                                        o_est = 170
-                                    elif tid == micro_oracles.TEST_SERDE_RECURSION:
                                         o_est = 140
+                                    elif tid == micro_oracles.TEST_SCOPE:
+                                        o_est = 450
+                                    elif tid == micro_oracles.TEST_QUALIFY_CTE_CHAIN:
+                                        o_est = 550
+                                    elif tid == micro_oracles.TEST_DEEP_AST_ANNOTATION:
+                                        o_est = 450
+                                    elif tid == micro_oracles.TEST_SERDE_RECURSION:
+                                        o_est = 300
                                     elif tid == micro_oracles.TEST_NAMED_SELECTS_CHAIN:
-                                        o_est = 40
+                                        o_est = 80
                                     elif tid == micro_oracles.TEST_GENERATOR_MEMORY:
                                         n_d = len(dialect_map[tid]) if tid in dialect_map else 33
-                                        o_est = 60 + n_d * (3 if use_gen_mem_escalate else 10)
+                                        o_est = 60 + n_d * (5 if use_gen_mem_escalate else 12)
                                     if cur_cost - cost(current_req - {positions[i]}) <= o_est + 50:
                                         dialect_map.pop(tid, None)
                                         excluded.add(i)
@@ -439,20 +456,20 @@ def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
                         tid = index.ids[i]
                         if _is_active_oracle(tid):
                             if tid == micro_oracles.TEST_MAX_NODES:
-                                return 1600
-                            if tid == micro_oracles.TEST_SCOPE:
-                                return 550
-                            if tid == micro_oracles.TEST_QUALIFY_CTE_CHAIN:
-                                return 660
-                            if tid == micro_oracles.TEST_DEEP_AST_ANNOTATION:
-                                return 170
-                            if tid == micro_oracles.TEST_SERDE_RECURSION:
                                 return 140
+                            if tid == micro_oracles.TEST_SCOPE:
+                                return 450
+                            if tid == micro_oracles.TEST_QUALIFY_CTE_CHAIN:
+                                return 550
+                            if tid == micro_oracles.TEST_DEEP_AST_ANNOTATION:
+                                return 450
+                            if tid == micro_oracles.TEST_SERDE_RECURSION:
+                                return 300
                             if tid == micro_oracles.TEST_NAMED_SELECTS_CHAIN:
-                                return 40
+                                return 80
                             if tid == micro_oracles.TEST_GENERATOR_MEMORY:
                                 n_d = len(dialect_map[tid]) if tid in dialect_map else 33
-                                return 60 + n_d * (3 if use_gen_mem_escalate else 10)
+                                return 60 + n_d * (5 if use_gen_mem_escalate else 12)
                         sp = slice_map.get(tid)
                         if sp is not None:
                             if tid == slicer.TEST_EXECUTE_TPCH:

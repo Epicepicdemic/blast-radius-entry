@@ -492,3 +492,43 @@ class HeavyStep2Tests(unittest.TestCase):
                     sys.modules.pop(k, None)
                 else:
                     sys.modules[k] = old
+
+    def test_shared_state_mutators_and_def_header_bit0(self):
+        from verify import SHARED_STATE_MUTATORS
+
+        for tid in SHARED_STATE_MUTATORS:
+            self.assertFalse(runnable(tid, inline_pool=True, setupclass_deamort=True))
+
+        # Def header line carrying shared bit0 (mask=1) must not poison body-only slices.
+        tid = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+        cov = CaseCoverage({
+            tid: {
+                "contexts": ["shared", "case:executor/0", "case:executor/1"],
+                "masks": ["0x1", "0x2", "0x4"],
+                "times_us": [0, 5000, 6000],
+                "lines": {
+                    "sqlglot/optimizer/pushdown_predicates.py": {
+                        "1": 0,   # def push_fn(x): -> shared bit0
+                        "3": 1,   # return x -> case:executor/0
+                    }
+                },
+                "opens": {},
+                "class_reads": {},
+                "dialect_reads": {},
+                "attributes": {},
+                "keys": {},
+                "raw_class_reads": {},
+            }
+        })
+        idx = _DummyIndex(
+            layout={"sqlglot/optimizer/pushdown_predicates.py": ([[1, 4]], [])},
+            statements={},
+        )
+        old_src = "def push_fn(x):\n    if False:\n        return 0\n    return x\n"
+        new_uncov = "def push_fn(x):\n    if False:\n        return 99\n    return x\n"
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            ch = _diff_change(root, "sqlglot/optimizer/pushdown_predicates.py", old_src, new_uncov)
+            sp = cov.plan_slice(tid, [ch], idx)
+            self.assertFalse(sp["full"])
+            self.assertEqual(sp["exec_indices"], [0])

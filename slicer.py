@@ -8,7 +8,7 @@ import pickle
 import sys
 import textwrap
 
-from patching import overlaps
+from patching import overlaps, parsed_source
 
 
 TEST_EXECUTE_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
@@ -48,6 +48,8 @@ PLAIN_FIXTURES = frozenset({
     "partial.sql",
     "optimizer/qualify_columns__invalid.sql",
 })
+MAX_DIRECT_SIGNATURES = 4
+MIN_FULL_SIGNATURE_SAVING_MS = 9500
 TPCDS_FIXTURE = "optimizer/tpc-ds/tpc-ds.sql"
 TPCH_FIXTURE = "optimizer/tpc-h/tpc-h.sql"
 
@@ -285,10 +287,11 @@ class CaseCoverage:
                 if ptr is not None:
                     hit |= masks[ptr]
                 else:
-                    # Uncovered line inside an enclosing function: widen to cases that entered it.
+                    # Uncovered line inside an enclosing function: widen to cases that entered it,
+                    # skipping the import-time def-header line fa (which carries shared bit0).
                     owners.sort(key=lambda ab: ab[1] - ab[0])
                     for fa, fb in owners:
-                        fn_hit = _td_range_mask(lines_map, masks, fa, fb)
+                        fn_hit = _td_range_mask(lines_map, masks, fa + 1, fb)
                         if fn_hit:
                             hit |= fn_hit
                             break
@@ -301,7 +304,7 @@ class CaseCoverage:
                 owners.sort(key=lambda ab: ab[1] - ab[0])
                 fn_hit = 0
                 for fa, fb in owners:
-                    fn_hit = _td_range_mask(lines_map, masks, fa, fb)
+                    fn_hit = _td_range_mask(lines_map, masks, fa + 1, fb)
                     if fn_hit:
                         break
                 if fn_hit:
@@ -320,8 +323,8 @@ class CaseCoverage:
                             hit |= _td_bit(td, "keys", key)
 
             try:
-                ast.parse(change.before, type_comments=True)
-                ast.parse(change.after, type_comments=True)
+                parsed_source(change.before)
+                parsed_source(change.after)
             except SyntaxError:
                 return 1
 
@@ -517,14 +520,17 @@ def _hash_step_tree(root, pe, out_h):
     walk_exec(root)
 
 
-def tpcds_query_sig(sql, meta, schema=None, dummy_base=None):
-    from sqlglot import find_tables, parse_one, transpile
-    from sqlglot.executor.python import PythonExecutor
-    from sqlglot.executor.table import Table, ensure_tables
-    from sqlglot.optimizer import optimize
-    from sqlglot.planner import Plan
-    from sqlglot.schema import ensure_schema
-    from tests.helpers import TPCDS_SCHEMA
+def tpcds_query_sig(sql, meta, schema=None, dummy_base=None, _mods=None):
+    if _mods is None:
+        from sqlglot import find_tables, parse_one, transpile
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.executor.table import Table, ensure_tables
+        from sqlglot.optimizer import optimize
+        from sqlglot.planner import Plan
+        from sqlglot.schema import ensure_schema
+        from tests.helpers import TPCDS_SCHEMA
+    else:
+        find_tables, parse_one, transpile, PythonExecutor, Table, ensure_tables, optimize, Plan, ensure_schema, TPCDS_SCHEMA = _mods
 
     h = hashlib.blake2b(digest_size=16)
     h.update(transpile(sql, write="duckdb")[0].encode())
@@ -560,6 +566,29 @@ def tpcds_query_sig(sql, meta, schema=None, dummy_base=None):
     return h.digest()
 
 
+def _tpcds_sig_mods():
+    from sqlglot import find_tables, parse_one, transpile
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.table import Table, ensure_tables
+    from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
+    from sqlglot.schema import ensure_schema
+    from tests.helpers import TPCDS_SCHEMA
+
+    return (
+        find_tables,
+        parse_one,
+        transpile,
+        PythonExecutor,
+        Table,
+        ensure_tables,
+        optimize,
+        Plan,
+        ensure_schema,
+        TPCDS_SCHEMA,
+    )
+
+
 def build_tpcds_baseline(root, out_path):
     root_str = str(root)
     old_cwd = os.getcwd()
@@ -576,7 +605,8 @@ def build_tpcds_baseline(root, out_path):
         sqls = list(load_sql_fixture_pairs(TPCDS_FIXTURE))
         schema = ensure_schema(TPCDS_SCHEMA)
         dummy_base = {t: Table(columns=tuple(cols.keys()), rows=[]) for t, cols in TPCDS_SCHEMA.items()}
-        sigs = [tpcds_query_sig(sql, meta, schema=schema, dummy_base=dummy_base) for meta, sql, _ in sqls]
+        mods = _tpcds_sig_mods()
+        sigs = [tpcds_query_sig(sql, meta, schema=schema, dummy_base=dummy_base, _mods=mods) for meta, sql, _ in sqls]
         Path(out_path).write_bytes(marshal.dumps(sigs))
         return sigs
     finally:
@@ -610,11 +640,12 @@ def compute_tpcds_mismatches(baseline_sigs, indices=None, max_mismatches=None):
     target_indices = range(n_total) if indices is None else [int(i) for i in indices if 0 <= int(i) < n_total]
     schema = ensure_schema(TPCDS_SCHEMA)
     dummy_base = {t: Table(columns=tuple(cols.keys()), rows=[]) for t, cols in TPCDS_SCHEMA.items()}
+    mods = _tpcds_sig_mods()
     mismatched = []
     for idx in target_indices:
         meta, sql, _ = sqls[idx]
         try:
-            sig = tpcds_query_sig(sql, meta, schema=schema, dummy_base=dummy_base)
+            sig = tpcds_query_sig(sql, meta, schema=schema, dummy_base=dummy_base, _mods=mods)
         except BaseException:
             mismatched.append(idx)
             if max_mismatches is not None and len(mismatched) > max_mismatches:
