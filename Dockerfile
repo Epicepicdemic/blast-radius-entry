@@ -79,3 +79,6 @@ RUN python /w3/install.py --app /app --pin /sqlglot && python -m compileall -q /
 COPY w4/ /w4/
 RUN python /w4/install.py && python -m compileall -q /app
 CMD ["python", "/app/wave4_entry.py"]
+COPY w5/ /w5/
+RUN python /w5/install.py && python -m compileall -q /app
+CMD ["python", "/app/wave5_entry.py"]

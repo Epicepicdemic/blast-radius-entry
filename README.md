@@ -1,6 +1,14 @@
 # Blast Radius
 
-## This version: Wave-4 (team's own work)
+## This version: Wave-5 (team's own work)
+
+This version is our team's own Wave-5 work, built on our Wave-4 entry (`7c2f0c5`). No code from other teams is included. What changed since `7c2f0c5`:
+
+- **New `w5/` directory.** It holds the Wave-5 modules, `w5/install.py` and the compressed pin-only profiles in `w5/profile/`, with the collectors that produced them. Every profile observes the unmodified pinned SQLGlot test suite. None is derived from evaluation patches, samples or failure sets.
+- **Updated Wave-3 and Wave-4 modules and tests.** These include the fixed import-binding check in `read_effects.missing_call`, which now counts imports, defs and classes as bindings, and the conservative fallback for dynamic metaclass registration. `tests/test_census.py` and `tests/test_shared_writes.py` change, and `tests/test_wave5_fixtures.py` is new.
+- **`Dockerfile`, `.dockerignore` and `README-wave5.md`.** The Dockerfile installs the Wave-5 layer after Wave-4; `README-wave5.md` gives the overlay's build notes.
+
+## Previous version: Wave-4 (team's own work)
 
 This version is our team's own Wave-4 work, built on our Wave-3 entry (`be5d6e4`). No code from other teams is included. What changed since `be5d6e4`:
 

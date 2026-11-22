@@ -104,6 +104,89 @@ class SharedWritesTest(unittest.TestCase):
         self.assertFalse(guarded("import builtins as b\ndef f():\n b.list(C.data)  # edit"))
         self.assertFalse(guarded("from builtins import iter as it\ndef f():\n it(C.data)  # edit"))
 
+    def test_calls_bound_only_in_the_postimage(self):
+        from census import Census
+        from read_effects import missing_call
+        from surgery5 import unbound
+
+        # Simulate the actual pin census before introducing the new binding.
+        project = Census(dict(modules={"example": {}}, classes={}, attr_kinds={},
+                              instance_attrs=[], params={}, written=[]))
+        for declaration, operand in [
+            ("import mutation", "mutation.update"),
+            ("import mutation.ops", "mutation.ops.update"),
+            ("import mutation as use", "use.update"),
+            ("from mutation import update", "update"),
+            ("from mutation import update as use", "use"),
+            ("def use(data): data.clear()", "use"),
+            ("async def use(data): data.clear()", "use"),
+            ("class Use: pass", "Use"),
+            ("from mutation import *", "use"),
+        ]:
+            with self.subTest(declaration=declaration):
+                tree = ast.parse("class Registry: pass\n" + declaration +
+                                 "\ndef f():\n    " + operand + "(Registry.table)\n")
+                scope = tree.body[-1]
+                call = scope.body[0].value
+                resolver = project.resolver("example", "example.py", tree)
+                self.assertFalse(missing_call(call, scope, resolver))
+                root = call.func
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                self.assertFalse(unbound(root, scope, resolver))
+                from shared_writes import shared_write_effect
+                full, protected = shared_write_effect(tree, {call.lineno}, census=resolver,
+                                                      narrow_shared_args=True, module="example")
+                self.assertTrue(full or protected)
+        tree = ast.parse("def f():\n    never_bound_here(1)")
+        scope = tree.body[0]
+        self.assertTrue(missing_call(scope.body[0].value, scope,
+                                     project.resolver("example", "example.py", tree)))
+
+    def test_registration_is_a_shared_effect(self):
+        from registration5 import changes_registry
+        path = "sqlglot/example.py"
+        cases = [
+            ("from x import Dialect\n", "class Adapter(Dialect): pass\n"),
+            ("from x import Dialect as Base\n", "def make():\n    class Adapter(Base): pass\n"),
+            ("class Hooked:\n def __init_subclass__(cls): pass\n", "class Child(Hooked): pass\n"),
+            ("import x\n", "class Adapter(metaclass=x.DialectType): pass\n"),
+            ("from types import new_class as build\n", "def make():\n return build('Adapter', (Base,))\n"),
+            ("def make():\n pass\n", "def another():\n return type('Adapter', (Base,), {})\n"),
+        ]
+        with TemporaryDirectory() as work:
+            root = Path(work).resolve()
+            (root / path).parent.mkdir()
+            for before, added in cases:
+                for old, new in [(before, before+added), (before+added, before)]:
+                    with self.subTest(source=new):
+                        (root / path).write_text(old)
+                        from patching import base
+                        base.cache_clear()
+                        diff = difflib.unified_diff(old.splitlines(True), new.splitlines(True),
+                                                    "a/"+path, "b/"+path, n=0)
+                        change, = apply_patch("".join(diff).encode(), root)
+                        self.assertTrue(changes_registry(change))
+        self.assertTrue(guarded("def load():\n class Register(Parent): pass  # edit"))
+        self.assertTrue(guarded("class Register(metaclass=Meta): pass  # edit"))
+        self.assertFalse(guarded("class Adapter(Parent):\n def f(self):\n  return 2  # edit"))
+
+    def test_foreign_write_roots_follow_aliases(self):
+        from types import SimpleNamespace
+        from ownership_effects import roots
+        for statement in ("for m in (Registry.table,):\n        m.clear()",
+                          "m, _ = Registry.table, None\n    m.clear()",
+                          "m, = [Registry.table]\n    m.clear()",
+                          "self.m = Registry.table\n    self.m.clear()",
+                          "a = b = Registry.table\n    b.clear()",
+                          "m = [item for item in (Registry.table,)][0]\n    m.clear()"):
+            with self.subTest(statement=statement):
+                src=("def f(self):\n    "+statement+"\n").encode()
+                fn=ast.parse(src).body[0]
+                ch=SimpleNamespace(before=src,after=src,path="sqlglot/example.py")
+                actual=roots(None,ch,fn,"f",fn,{"table":1})
+                self.assertTrue(actual is None or actual&1)
+
     def test_both_diff_coordinates_before_other_selection(self):
         path = "sqlglot/example.py"
         prefix = "def f():\n" + "    pass\n" * 8

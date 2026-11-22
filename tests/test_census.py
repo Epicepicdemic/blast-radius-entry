@@ -136,6 +136,20 @@ class CensusResolverTest(unittest.TestCase):
         resolver = Census(DOC).resolver("m", "sqlglot/m.py", tree)
         full, _ = shared_write_effect(tree, {2}, None, "m", narrow_shared_args=True, census=resolver)
         self.assertTrue(full)   # mystery() is unproven
+        for binding in ("import mystery", "from external import mystery", "from external import *",
+                        "def mystery(): pass", "async def mystery(): pass", "class mystery: pass"):
+            with self.subTest(binding=binding):
+                doc = ast.parse(binding + "\n" + source)
+                postimage = Census(DOC).resolver("m", "sqlglot/m.py", doc)
+                full, _ = shared_write_effect(doc, {doc.body[-1].body[0].lineno}, None, "m",
+                                              narrow_shared_args=True, census=postimage)
+                self.assertTrue(full)
+        chained = ast.parse("def f(self, expression):\n    expression.is_type("
+                            "type(self.dialect).__class__.__new__(type(type(self.dialect)), "
+                            "'Alias', (type(self.dialect),), {}))")
+        resolver = Census(DOC).resolver("m", "sqlglot/m.py", chained)
+        self.assertTrue(shared_write_effect(chained, {2}, None, "m", narrow_shared_args=True,
+                                            census=resolver)[0])
         source = "def f(node, shared_p, obj, items, *rest):\n    node.is_type(exp.DType.INT)\n"
         tree = ast.parse(source)
         resolver = Census(DOC).resolver("m", "sqlglot/m.py", tree)
