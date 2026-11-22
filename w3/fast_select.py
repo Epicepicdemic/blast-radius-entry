@@ -43,8 +43,21 @@ class Selector:
         reason=""
         weight=0
         provisional=False
-        if len(changes)>1 and any(not c.path.startswith("tests/fixtures/") or not c.path.endswith(".sql") for c in changes):
-            return ix.all,True,"combined change",False,sum(len(c.before) for c in changes)
+        if len(changes)>1:
+            from compact import trivia
+            actual=[]
+            for ch in changes:
+                ignored=trivia(ix,ch)
+                if ignored is None:actual.append(ch)
+                else:combined|=ignored
+            if not actual:
+                return combined,False,"compiled trivia with source readers",True,weight
+            if len(actual)==1 and len(actual)<len(changes):
+                child=self.draft(path,actual)
+                return combined|child[0],child[1],child[2],child[3],child[4]
+            if any(not c.path.startswith("tests/fixtures/") or not c.path.endswith(".sql") for c in actual):
+                return ix.all,True,"combined change",False,sum(len(c.before) for c in changes)
+            changes=actual
         for ch in changes:
             section=ix.section(ch.path)
             if section is None or sha256(ch.before).digest()!=section["digest"]:
@@ -55,6 +68,13 @@ class Selector:
                 combined|=b[1]|b[2]
                 reason=b[3]
                 continue
+            if ch.path.startswith("tests/test_") and ch.path.endswith(".py"):
+                from delayed import uncalled_test_helper
+                helper=uncalled_test_helper(ix,ch)
+                if helper is not None:
+                    combined|=helper
+                    reason="uncalled test helper"
+                    continue
             weight+=len(ch.before)*(1+len(ch.added)+len(ch.removed))
             if not (ch.path.startswith("sqlglot/") and ch.path.endswith(".py")):
                 return ix.all,True,"outside code index",False,weight
@@ -62,6 +82,23 @@ class Selector:
             if points.intersection(section["order"]) or points.intersection(section["warm_unknown"]):
                 return ix.all,True,"uncertain trace points",False,weight
             left,right=physical_lines(ch.before),physical_lines(ch.after)
+            from scalar_bounds import scalar_bound
+            scalar=scalar_bound(ix,ch,section)
+            if scalar is not None and not scalar[0]:
+                combined |= scalar[1]
+                reason="unchanged scalar predicate on pin operands"
+                continue
+            if ch.path.startswith(("sqlglot/dialects/","sqlglot/parsers/","sqlglot/generators/")):
+                from bounds import scalar_field
+                mask=scalar_field(ix,ch,section)
+                if mask is not None:
+                    cert=classify(ix,ch)
+                    if cert is not None:
+                        mask &= cert[1]|cert[2]
+                    combined |= mask
+                    reason="concrete scalar class readers"
+                    provisional=True
+                    continue
             if section.get("owned_copy"):
                 from ownership import unchanged_copy
                 scope = unchanged_copy(section, ch, left, right)
@@ -123,6 +160,35 @@ class Selector:
             selected|=self.pool
             protected|=self.pool
         raw = (selected, protected, watch, hot, writers, process_time()-began)
+        if len(changes)==1:
+            from exception_arg import exception_bound
+            if changes[0].path.endswith(".py") and selected==ix.all:
+                limit=exception_bound(ix,changes[0])
+                if limit is not None and limit!=ix.all:
+                    return limit,True,"builtin exception message",None
+            from bounds import bound as wave4_bound
+            result=wave4_bound(self,changes[0],selected,protected,hot,writers,self.team.scoped_effects)
+            if result is not None:
+                limit,reason,*proof=result
+                if selected & ~limit:
+                    bounded=(selected & limit, proof[0] if proof else protected & limit, watch, hot, 0 if proof else writers, raw[-1])
+                    return selected & limit,True,reason,bounded
+        if len(changes)==1 and (writers or protected==ix.all) and changes[0].path.startswith("sqlglot/"):
+            from witness import candidate
+            w=candidate(ix,changes[0])
+            if w is not None and not writers:
+                from snapshot_cone import runtime_readers
+                from module_gate import candidate as module_candidate
+                snapshot=runtime_readers(self.team,changes,equal_trees)
+                if (snapshot is not None and snapshot[1]!=ix.all) or (snapshot is None and module_candidate(self.team,changes,None,equal_trees) is not None):
+                    w=None
+            if w is not None:
+                cap,owed,whot=w
+                if not cap:
+                    return owed,True,"unreached control-flow frontier",None
+                from state_watch import DEEP_WATCH
+                tailored=(cap|owed,owed,(DEEP_WATCH,),whot,cap,raw[-1])
+                return ix.all,True,"paired frontier writers",tailored
         if writers:
             return ix.all, True, "unresolved shared writer", raw
         if bound:
@@ -180,7 +246,15 @@ def run(out,root,data,app):
         def initial(path):
             from static_bounds import stress_obligation
             changes = read_patch(path, root)
-            return selector.draft(path, changes), stress_obligation(ix, changes)
+            owed=stress_obligation(ix,changes)
+            for ch in changes:
+                if ch.path.startswith(("sqlglot/parsers/","sqlglot/generators/")) and ch.removed and not ch.added:
+                    lines=physical_lines(ch.before)
+                    if any(lines[i-1].lstrip().startswith(("def ","async def ")) for i in ch.removed):
+                        from delayed import sole_lookup
+                        if sole_lookup(ix,ch) is not None:
+                            owed|=ix.bits(ix.meta["stress"])
+            return selector.draft(path, changes), owed
 
         for path, row in bounded_results(paths, initial, deadline, per_commit=2):
             if row is None:
@@ -198,11 +272,19 @@ def run(out,root,data,app):
                 return
             retry.discard(path)
             mask, rev, reason, raw = row
+            if reason in ("concrete class-table reads","unresolved eager table operand","unresolved eager import","removed namespace binding","removed eager dependency"):
+                from bounds import facts
+                mandatory[path] |= (facts()["resources"] & mask) if reason=="concrete class-table reads" else facts()["import_stress"]
+            if reason == "forward shared-store bound":
+                mandatory[path] |= mask
+            if reason == "private method lookup":
+                # A deleted parser/generator hook can shift resource failures across workers.
+                mandatory[path] |= ix.bits(ix.meta["stress"])
             if raw is not None:
                 analyzed[path] = raw
             if reason == "invalid Python postimage":
                 invalid.add(path)
-            if reason in ("unresolved shared writer", "invalid Python postimage"):
+            if reason in ("unresolved shared writer", "invalid Python postimage", "paired frontier writers"):
                 choices[path] = (ix.all, True, reason)
             else:
                 choices[path] = (choices[path][0] & mask, rev, reason)
@@ -288,11 +370,18 @@ def run(out,root,data,app):
                 if path in active or path in invalid:
                     continue
                 keep = required[path]
-                if keep and max(durations[n] for n in keep) >= 20000:
+                if keep:
                     workers = allocate(keep, ranked, durations)
                     bill = charge(workers, durations)
-                    if bill >= 25000:
-                        expensive.append((path, bill))
+                    if bill >= 25000 and max(durations[n] for n in keep) >= 20000 and path in analyzed:
+                        raw=analyzed[path]
+                        mask=choices[path][0]
+                        removable=bool(mask & ~raw[1])
+                        # A cold-import obligation may disappear after the original
+                        # snapshot. A narrow upper bound can leave just one long test.
+                        conditional=raw[0]==raw[1]==ix.all and not raw[4] and mask!=ix.all
+                        if removable or conditional:
+                            expensive.append((path,bill))
             from live import LiveVerifier, MAX_CPU_SECONDS
             live_paths = [p for p, _ in expensive]
             bounds = {p: (choices[p][0] | mandatory[p], mandatory[p]) for p in live_paths}
@@ -302,7 +391,19 @@ def run(out,root,data,app):
                 for i, (path, bill) in enumerate(expensive):
                     if monotonic() >= deadline - 0.5:
                         break
-                    seconds = min(MAX_CPU_SECONDS, bill / 2000.0)
+                    from pricing import cost_lower_bound
+                    raw=analyzed.get(path)
+                    irrevocable=mandatory[path]
+                    if raw and not raw[4]:
+                        if raw[1]!=ix.all:
+                            irrevocable |= raw[1] & choices[path][0]
+                        elif len(raw)>6 and raw[6] is not None:
+                            irrevocable |= raw[6][1] & choices[path][0]
+                    lower=cost_lower_bound(numbers_for(irrevocable,False),durations)
+                    seconds=min(MAX_CPU_SECONDS,(bill-lower)/1600.0)
+                    if raw and raw[4]:
+                        seconds=min(seconds,6.0)
+                    if seconds<0.4:continue
                     keep, cpu, route = live.request(i, seconds, deadline, numbers_for, required[path])
                     keep = keep | numbers_for(mandatory[path], False)
                     workers = allocate(keep, ranked, durations)

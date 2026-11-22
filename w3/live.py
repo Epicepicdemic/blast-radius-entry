@@ -10,7 +10,7 @@ from time import monotonic
 # At most one live request is outstanding. Reserve two CPUs' possible usage between polls.
 POLL_SECONDS = 0.025
 GUARD_SECONDS = 0.18
-MAX_CPU_SECONDS = 16.0
+MAX_CPU_SECONDS = 13.0
 MAX_REPLY = 65536
 
 

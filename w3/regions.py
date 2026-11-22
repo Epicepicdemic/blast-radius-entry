@@ -141,6 +141,10 @@ def fallback(index,ch,section,left,right):
             callback=witness(index,section,ch.path,name,a,b,start-1)
             if callback is not None and callback!=index.all:
                 return callback,False,"equivalent positional dispatch callback"
+        from dispatch_bounds import dispatch_bound
+        dispatch=dispatch_bound(index,ch,section,name,a,b)
+        if dispatch is not None:
+            return dispatch,True,"profiled dispatch table reads"
         exact=key_receipt(index,section,ch.path,name,a,b)
         if exact is not None:
             return exact,False,"observed immutable table value"

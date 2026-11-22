@@ -1,6 +1,14 @@
 # Blast Radius
 
-## This version: Wave-3 Hybrid (team's own work)
+## This version: Wave-4 (team's own work)
+
+This version is our team's own Wave-4 work, built on our Wave-3 entry (`be5d6e4`). No code from other teams is included. What changed since `be5d6e4`:
+
+- **New `w4/` directory.** It holds Wave-4 modules for class/namespace table bounds, dispatch-lookup bounds, function control-flow coverage, guard and witness checks, and pricing. It also holds `w4/install.py` and the compressed profiles in `w4/profile/`. Every profile is an observation of the unmodified pinned SQLGlot test suite, and the `*.py` collectors that produced them are included. No profile is derived from evaluation patches, samples or failure sets.
+- **Updated Wave-3 modules.** `w3/fast_select.py`, `w3/live.py` and `w3/regions.py` change: per-request CPU limits, priced live checks and the new bounds wiring.
+- **`Dockerfile`.** After the Wave-3 install, the Dockerfile copies `w4/` and runs `w4/install.py`. The image command is now `/app/wave4_entry.py`, which falls back to full-suite plans if the layer cannot load. **`.dockerignore`** admits `w4/`, and **`README-wave4.md`** gives the overlay's build notes.
+
+## Previous version: Wave-3 Hybrid (team's own work)
 
 This version is our team's own Wave-3 layer, built by the team on top of our previous entry (`5d6d8aa`). No code from other teams is included. What changed since `5d6d8aa`:
 

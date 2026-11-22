@@ -76,4 +76,6 @@ COPY heavy_reach.py heavy-reach.json snapshot_cone.py import_state.py maps.json 
 RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json case-coverage.json && python micro_oracles.py --build /sqlglot /app/dialect_modules.bin /app/test_scope_code.bin && python slicer.py --build-tpcds /sqlglot /app/tpcds_baseline.bin && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
 COPY w3/ /w3/
 RUN python /w3/install.py --app /app --pin /sqlglot && python -m compileall -q /app
-CMD ["python", "/app/wave3_entry.py"]
+COPY w4/ /w4/
+RUN python /w4/install.py && python -m compileall -q /app
+CMD ["python", "/app/wave4_entry.py"]
