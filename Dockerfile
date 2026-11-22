@@ -74,4 +74,6 @@ ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 SKIP_INTEGRATION=0 PYTHONDONTWRITEB
 WORKDIR /app
 COPY heavy_reach.py heavy-reach.json snapshot_cone.py import_state.py maps.json case-coverage.json batch_entry.py selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json inline_pool.py micro_oracles.py slicer.py ./
 RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json case-coverage.json && python micro_oracles.py --build /sqlglot /app/dialect_modules.bin /app/test_scope_code.bin && python slicer.py --build-tpcds /sqlglot /app/tpcds_baseline.bin && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
-CMD ["python", "/app/selector.py"]
+COPY w3/ /w3/
+RUN python /w3/install.py --app /app --pin /sqlglot && python -m compileall -q /app
+CMD ["python", "/app/wave3_entry.py"]

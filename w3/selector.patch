@@ -1,0 +1,113 @@
+--- a/selector.py
++++ b/selector.py
+@@ -72,7 +72,7 @@
+                  root=root, census_path=Path(__file__).with_name("census.json"))
+ 
+ 
+-def prepare_batch(root, patches, tests, ranked, durations, full_plan, started):
++def prepare_batch(root, patches, tests, ranked, durations, full_plan, started, *, precomputed=None):
+     from bounded_batch import BATCH_SECONDS
+     from cone import analyze as candidates, serialization_edit
+     from packing import pack, packed_cost
+@@ -119,6 +119,11 @@
+     suite = WarmSuite(root, index.ids)
+     suite.warm()
+     shared = persistent_readers(index)
++    # Only reuse syntax analysis when the actual warmed process agrees with the
++    # build-time shared-reader census used by the static worker.
++    stored = Path(__file__).with_name("shared.bin")
++    if not precomputed or not stored.is_file() or marshal.loads(stored.read_bytes()) != shared:
++        precomputed = {}
+     ordered = sorted((i for i, n in enumerate(positions) if n is not None),
+                      key=lambda i: index.ids[i])
+     duration = {i: durations[positions[i]] for i in ordered}
+@@ -167,6 +172,11 @@
+     def analyze(path):
+         start = process_time()
+         changes = read_patch(path, root)
++        cached = precomputed.get(path)
++        if cached is not None:
++            selected, protected, watches, hot, writers, charged = cached[:6]
++            snap = cached[6] if len(cached) > 6 else (runtime_readers(index, changes, equal_trees) if selected == protected == index.all else None)
++            return selected, protected, watches, hot, writers, snap, charged + process_time() - start
+         selected, protected, watches, hot, writers = candidates(index, changes, equal_trees, shared)
+         if selected and any(serialization_edit(c) for c in changes):
+             selected |= serde_sensitive
+@@ -205,7 +215,23 @@
+                     state_watch.deep = False
+         return passed, extra
+ 
+-    def plan_for(path, result):
++    batch_deadline = deadline
++
++    def plan_for(path, result, *, until=None, checkpoint=None, upper=None, owed=0):
++        nonlocal deadline
++        deadline = batch_deadline if until is None else min(until, batch_deadline)
++        if checkpoint is not None and result is not None and result[1] == index.all and not result[4]:
++            from module_gate import candidate, confirm
++            changes = read_patch(path, root)
++            bound = candidate(index, changes, result[5], equal_trees)
++            bounded = translate((bound & upper) | owed) | unknown | reverse_failures if bound is not None else None
++            if bounded is not None and cost(bounded) <= 16000:
++                ok, broken = confirm(suite, changes, deadline)
++                if broken:
++                    return full_plan
++                if ok:
++                    checkpoint(bound)
++                    return pack(bounded, ranked, durations, fill=False)
+         screened_import = False
+         if result is not None and result[5] is not None and suite.ready and monotonic() < deadline:
+             selected, protected, watch, hot, writers, (eager_importers, runtime_required), static_cpu = result
+@@ -228,6 +254,11 @@
+             return full_plan
+ 
+         selected, protected, watch, hot, writers, _, static_cpu = result
++        if upper is not None and not writers:
++            selected = (selected & upper) | owed
++            protected = (protected & upper) | owed
++        if checkpoint is not None and not writers:
++            checkpoint(selected | protected)
+         remaining_cpu = cap - static_cpu
+ 
+         if not heavy_enabled or writers:
+@@ -285,7 +316,12 @@
+                                 if (use_row_slice and case_cov is not None)
+                                 else None
+                             )
+-                            baseline_sigs = get_tpcds_baseline() if use_twophase_tpc else None
++                            # Structural digests do not cover executor runtime effects. If every
++                            # execution row is exposed, no digest match can clear this obligation.
++                            runtime_exposed = ((sp_tpc is None or sp_tpc["full"]) and any(
++                                c.path.startswith(slicer.TPCDS_BACKEND_PREFIXES) or c.path in slicer.TPCDS_BACKEND_FILES
++                                for c in changes))
++                            baseline_sigs = get_tpcds_baseline() if use_twophase_tpc and not runtime_exposed else None
+                             if use_twophase_tpc and baseline_sigs is not None:
+                                 p2 = set(sp_tpc["phase2_indices"] or ()) if (sp_tpc is not None and not sp_tpc["full"]) else set()
+                                 if len(p2) > 10:
+@@ -308,6 +344,8 @@
+                                                 blocked.update(reverse_failures)
+                                             tpc_floor = blocked | reverse_failures | {tpcds_num}
+                                             attainable_saving = max(tpcds_marginal, cost(tpc_floor) - cost(blocked))
++                                            if checkpoint is not None:
++                                                p1_cap = min(p1_cap, attainable_saving / 2000.0)
+                                             ok_p1, mismatched = suite.verify_tpcds_phase1(
+                                                 changes,
+                                                 hot,
+@@ -356,6 +394,8 @@
+ 
+                     # Recompute current cost after any TPC-DS Phase 1 clear.
+                     if passed:
++                        if checkpoint is not None:
++                            checkpoint((selected & ~passed) | protected)
+                         current_req = translate(selected & ~passed) | unknown
+                         if current_req:
+                             current_req.update(reverse_failures)
+@@ -609,6 +649,8 @@
+                                 else:
+                                     heavy_cap = min(13.0, max(2.0, potential_savings / 1000.0 * 1.25), max(0.5, rem - 1.5))
+ 
++                                if checkpoint is not None:
++                                    heavy_cap = min(heavy_cap, potential_savings / 2000.0)
+                                 if ordered_items and rem > 1.5 and heavy_cap > 0.1:
+                                     items_spec = [
+                                         (i, _is_active_oracle(index.ids[i]), duration[i] == 0)

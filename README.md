@@ -1,5 +1,16 @@
 # Blast Radius
 
+## This version: Wave-3 Hybrid (team's own work)
+
+This version is our team's own Wave-3 layer, built by the team on top of our previous entry (`5d6d8aa`). No code from other teams is included. What changed since `5d6d8aa`:
+
+- **New `w3/` directory.** It holds the Wave-3 modules (`fast_select.py`, `static_bounds.py`, `live.py`, `branch_reach.py`, `coverage_skip.py` and others), three integration patches (`selector.patch`, `verify.patch`, `heavy_reach.patch`) and the compressed profiles in `w3/profile/`. Every profile is an observation of the unmodified pinned SQLGlot test suite, and the `*_profile.py` scripts that produced them are included. No profile is derived from evaluation patches, samples or failure sets.
+- **`Dockerfile`.** After the existing build steps, the Dockerfile copies `w3/` and runs `w3/install.py`. The script checks the digests of the original `selector.py`, `verify.py` and `heavy_reach.py`, applies the three patches, installs the Wave-3 modules, and builds the extra index from the pin and the profiles. The image command is now `/app/wave3_entry.py`. It falls back to full-suite plans if the Wave-3 layer cannot load.
+- **`.dockerignore`** admits `w3/`. **`README-wave3.md`** gives the overlay's own build notes.
+- **Selection changes.** A faster static selector prices every patch first. A second static attempt applies verified bounds, including a coverage refinement guarded by writer, protected-reader, cold-function and reflection checks. The live verifier runs within a per-request CPU limit. TPC-DS uses branch certificates against the pin's recorded signature execution.
+
+Everything below describes the underlying line C selector that Wave-3 builds on.
+
 A coverage-guided test selector with a bounded unittest verifier for SQLGlot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It reads independent unified diffs and the numbered test manifest in `/data`, then prints one JSON object per commit.
 
 ## How selection works

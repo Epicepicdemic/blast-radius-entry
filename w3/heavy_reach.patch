@@ -1,0 +1,31 @@
+--- a/heavy_reach.py
++++ b/heavy_reach.py
+@@ -421,16 +421,22 @@
+         if module_name not in sys.modules:
+             return True
+     if not absent and hot and all(edit[0] == path for edit in hot):
++        if task == "tpc":
++            from branch_reach import same_signature
++            if same_signature(change, hot):
++                importlib.import_module(module_name)
++                return True
+         calls = rules["functions"].get(path)
+         cold = calls is not None and all(name not in calls for _, name, _, _ in hot)
+         if not cold and calls is not None and task == "tpc" and path in rules["lines"]:
+-            from cone import functions
+-
+-            original = functions(change.before)[1]
+-            patched = functions(change.after)[1]
++            # Match profiler qualnames, rejecting ambiguous/redefined declarations.
++            from impact import functions
++
++            original = functions(change.before)
++            patched = functions(change.after)
+             cold = all(
+-                name in original
+-                and name in patched
++                original.get(name) is not None
++                and patched.get(name) is not None
+                 and same_header(original[name], patched[name])
+                 and (
+                     name not in calls

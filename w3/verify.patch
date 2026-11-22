@@ -1,0 +1,29 @@
+--- a/verify.py
++++ b/verify.py
+@@ -655,6 +655,8 @@
+ 
+ def fork_reply_line(run_write, deadline, cap):
+     """Run ``run_write(write_fd)`` in a bounded fork and return its single reply line or None."""
++    from live import fork_allowance
++    cap = fork_allowance(cap)
+     if cap <= 0 or monotonic() >= deadline:
+         return None
+     read_fd, write_fd = os.pipe()
+@@ -716,6 +718,8 @@
+ 
+ def fork_masks_stream(run_write, deadline, cap):
+     """Run ``run_write(write_fd)`` in a bounded fork, streaming ``P <idx> <readers:x>``."""
++    from live import fork_allowance
++    cap = fork_allowance(cap)
+     if cap <= 0 or monotonic() >= deadline:
+         return 0, 0
+     read_fd, write_fd = os.pipe()
+@@ -848,6 +852,8 @@
+ 
+ def fork_masks(run, fallback, deadline, cap):
+     """Bound a fork and accept only two integer masks from a successful exit."""
++    from live import fork_allowance
++    cap = fork_allowance(cap)
+     if cap <= 0 or monotonic() >= deadline:
+         return fallback
+     read_fd, write_fd = os.pipe()
