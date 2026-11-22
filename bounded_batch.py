@@ -1,5 +1,6 @@
 """Run patch analysis in a killable worker under one wall-clock deadline."""
 import errno
+import gc
 import multiprocessing
 import resource
 from stat import S_ISREG
@@ -30,6 +31,9 @@ def _serve(channel, parent_channel, analyze):
         limit_child_resources(CHILD_ADDRESS_SPACE)
     except (ValueError, OSError):
         return  # A worker without an enforceable ceiling cannot supply evidence.
+    # This child only analyzes syntax. Exclude the inherited suite from cyclic
+    # collections while continuing to collect trees allocated by the worker.
+    gc.freeze()
     while True:
         try:
             path = channel.recv()

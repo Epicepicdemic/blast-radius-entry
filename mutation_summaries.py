@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 
 from shared_writes import FUNCTIONS, MUTATORS, PURE_BUILTINS, SCOPES, scope_members as members
-from patching import overlaps
+from patching import overlaps, parsed_source
 
 MISSING = object()
 RETAINING_BUILTINS = frozenset("iter sorted list dict tuple set frozenset min max sum "
@@ -465,7 +465,7 @@ class Project:
         source = self.sources.get(module)
         if source is None or (tree is not None and source.tree is not tree):
             if tree is None:
-                tree = ast.parse(self.edits[module], type_comments=True)
+                tree = parsed_source(self.edits[module])
             source = Source(module, tree, module in self.data["packages"], self.budget)
             self.sources[module] = source
             self.attribute_writes.update(source.attribute_writes)

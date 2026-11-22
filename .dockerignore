@@ -2,6 +2,7 @@
 !builder/
 !builder/**
 !maps.json
+!case-coverage.json
 !census_params.json
 # The entry COPY names each runtime module explicitly. Allow root Python
 # sources so adding a module there does not require a second file-list edit.

@@ -1,4 +1,5 @@
 """Strictly apply text hunks to pinned bytes. Unsupported metadata widens selection."""
+import ast
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -8,6 +9,17 @@ import re
 
 MAX_CHANGED_LINES = 2000
 MAX_PATCH_BYTES = 1024 * 1024
+
+
+# Static selection and cone analysis inspect the same two versions in succession.
+@lru_cache(maxsize=2)
+def parsed_source(source):
+    return ast.parse(source, type_comments=True)
+
+
+@lru_cache(maxsize=1)
+def compiled_source(source, path):
+    return compile(source, path, "exec", dont_inherit=True)
 
 
 def overlaps(sorted_points, first, last):

@@ -17,6 +17,27 @@ class HeaderEditTest(unittest.TestCase):
         a, b = pair(old, new)
         return cone.header_change_allowed(a, b, deferred)
 
+    def test_header_mask_restores_the_shared_parse_on_error(self):
+        from patching import Change, parsed_source
+        change = Change("sqlglot/demo.py", b"def f(a): return a\n", b"def f(a=1): return 2\n",
+                        removed={1}, added={1})
+        tree = parsed_source(change.after)
+        expected = ast.dump(tree, include_attributes=True)
+        def interrupt(left, right):
+            self.assertIs(right, tree)
+            raise RuntimeError("interrupted comparison")
+        with self.assertRaisesRegex(RuntimeError, "interrupted comparison"):
+            cone.body_changes(change, interrupt)
+        self.assertEqual(ast.dump(tree, include_attributes=True), expected)
+
+    def test_compiled_source_distinguishes_text_and_filename(self):
+        from patching import compiled_source
+        raw = b"x = 1"
+        self.assertEqual(compiled_source(raw, "a.py").co_filename, "a.py")
+        self.assertEqual(compiled_source(raw, "b.py").co_filename, "b.py")
+        with self.assertRaises(SyntaxError):
+            compiled_source(b"break", "b.py")
+
     def test_signature_changes(self):
         self.assertTrue(self.allowed("def f(a): pass", "def f(a, b=None): pass"))
         self.assertTrue(self.allowed("def f(a, b=1): pass", "def f(a, *, b=1): pass"))

@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 
 from change_shapes import align_directives
-from patching import overlaps
+from patching import compiled_source, overlaps, parsed_source
 from shared_writes import MUTATORS, OPERATOR_CALLS
 from state_watch import DEEP_STATE, DEEP_WATCH
 
@@ -105,7 +105,7 @@ def header_changed(old, new):
 
 @lru_cache(maxsize=32)
 def functions(source):
-    tree = ast.parse(source, type_comments=True)
+    tree = parsed_source(source)
     owners = {}
 
     def collect(body, prefix):
@@ -281,7 +281,7 @@ def analyze(index, changes, equal, shared=None):
         points = change.removed | change.insertions | {i+1 for i in change.insertions}
         if points.intersection(index.data.get("order_dependent_lines", {}).get(path, ())):
             return index.all, index.all, (), (), 0
-        compile(change.after, path, "exec", dont_inherit=True)
+        compiled_source(change.after, path)
         edits = body_changes(change, equal)
         protected |= readers
         if edits is None:

@@ -4,6 +4,7 @@ import functools
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 
 ROOT = "/sqlglot/"
@@ -11,6 +12,8 @@ monitor = sys.monitoring
 tool = monitor.COVERAGE_ID
 cold_test = os.environ.get("BR_COLD_TEST")
 context = ""
+ctx_t0 = time.perf_counter_ns()
+case_ns = defaultdict(int)
 hits = defaultdict(lambda: defaultdict(set))
 opens = defaultdict(set)
 loads = defaultdict(set)
@@ -86,16 +89,25 @@ def audit(event, args):
 
 
 def switch(key):
-    global context
+    global context, ctx_t0
     if cold_test:
         key = "test:" + cold_test
     if key != context:
+        now = time.perf_counter_ns()
+        if context.startswith("case:"):
+            case_ns[context] += now - ctx_t0
+        ctx_t0 = now
         context = key
         os.environ["BR_CONTEXT"] = key
         monitor.restart_events()
 
 
 def dump():
+    global ctx_t0
+    now = time.perf_counter_ns()
+    if context.startswith("case:"):
+        case_ns[context] += now - ctx_t0
+        ctx_t0 = now
     out = os.environ["BR_TRACES"]
     with open(f"{out}/{os.getpid()}.json", "w") as file:
         json.dump({
@@ -106,6 +118,7 @@ def dump():
             "opens": {k: sorted(v) for k, v in opens.items()},
             "loads": {k: sorted(v) for k, v in loads.items()},
             "submitters": sorted(submitters),
+            "case_ns": dict(case_ns),
         }, file, separators=(",", ":"))
 
 
@@ -134,6 +147,21 @@ def start():
             if path == "sqlglot/dialects/dialect.py":
                 from dialect_reads import install
                 install(module)
+            if path == "sqlglot/executor/python.py" and os.environ.get("BR_PHASE2_SPLIT") == "1":
+                orig_execute = module.PythonExecutor.execute
+
+                def traced_execute(self, plan):
+                    prev = context
+                    if prev.startswith("case:executor/"):
+                        idx = prev.split("/", 1)[1]
+                        switch("case:phase2/" + idx)
+                        try:
+                            return orig_execute(self, plan)
+                        finally:
+                            switch(prev)
+                    return orig_execute(self, plan)
+
+                module.PythonExecutor.execute = traced_execute
             return result
         finally:
             switch(previous)

@@ -40,6 +40,15 @@ ARG FAST_ANALYSIS=1
 ARG IDENTITY_EQUIVALENCE=1
 ARG CENSUS_ARGS=1
 ARG CENSUS_BLOCKS=1
+ARG INLINE_POOL=1
+ARG MICRO_ORACLES=1
+ARG SETUPCLASS_DEAMORT=1
+ARG ROW_SLICE=1
+ARG TWOPHASE_TPC=1
+ARG STRESS_PROBES=1
+ARG GEN_MEM_ESCALATE=1
+ARG ISOLATED_SCHEDULE=1
+ARG REACH_GATE=1
 ENV CENSUS_ARGS=$CENSUS_ARGS \
     CENSUS_BLOCKS=$CENSUS_BLOCKS \
     FAST_ANALYSIS=$FAST_ANALYSIS \
@@ -49,11 +58,18 @@ ENV CENSUS_ARGS=$CENSUS_ARGS \
     FUNCTION_INSERTIONS=$FUNCTION_INSERTIONS \
     CLASS_TABLE_ENTRIES=$CLASS_TABLE_ENTRIES \
     NARROW_SHARED_ARGS=$NARROW_SHARED_ARGS \
-    IDENTITY_EQUIVALENCE=$IDENTITY_EQUIVALENCE
+    IDENTITY_EQUIVALENCE=$IDENTITY_EQUIVALENCE \
+    INLINE_POOL=$INLINE_POOL \
+    MICRO_ORACLES=$MICRO_ORACLES \
+    SETUPCLASS_DEAMORT=$SETUPCLASS_DEAMORT \
+    ROW_SLICE=$ROW_SLICE \
+    TWOPHASE_TPC=$TWOPHASE_TPC \
+    STRESS_PROBES=$STRESS_PROBES \
+    GEN_MEM_ESCALATE=$GEN_MEM_ESCALATE \
+    ISOLATED_SCHEDULE=$ISOLATED_SCHEDULE \
+    REACH_GATE=$REACH_GATE
 ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 WORKDIR /app
-COPY snapshot_cone.py import_state.py maps.json batch_entry.py selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json ./
-RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
-# Bound glibc's per-thread arena reservations in DuckDB fixtures inside a capped fork.
-ENV MALLOC_ARENA_MAX=2
+COPY snapshot_cone.py import_state.py maps.json case-coverage.json batch_entry.py selector.py patching.py packing.py proofs.py shared_writes.py mutation_summaries.py bounded_batch.py cone.py verify.py state_watch.py fidelity.py fixture_overlay.py change_shapes.py table_readers.py import_readers.py pinned_data.py census.py census_params.json inline_pool.py micro_oracles.py slicer.py ./
+RUN python fidelity.py /sqlglot /app/maps.json /app/pool_readers.json && python import_readers.py /sqlglot /app/maps.json /app/import_readers.json && python table_readers.py /sqlglot /app/maps.json /app/table_readers.json && python mutation_summaries.py /sqlglot /app/mutations.json && python proofs.py /sqlglot /app/proof_facts.json && python pinned_data.py maps.json mutations.json case-coverage.json && python micro_oracles.py --build /sqlglot /app/dialect_modules.bin /app/test_scope_code.bin && python slicer.py --build-tpcds /sqlglot /app/tpcds_baseline.bin && python census.py build /sqlglot census_params.json census.json && rm census_params.json && python -m compileall -q /app /sqlglot/sqlglot /sqlglot/tests && python import_state.py /app/base_state.bin
 CMD ["python", "/app/selector.py"]
